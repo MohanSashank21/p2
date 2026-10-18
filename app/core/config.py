@@ -4,8 +4,7 @@ class Settings(BaseSettings):
   APP_NAME:str = "OpsPilot AI"
   APP_VERSION:str = "1.0.0"
   DEBUG:bool = True
-  MONGO_URI:str
-  DATABASE_NAME:str
+  DATABASE_URL:str
   model_config = SettingsConfigDict(
     env_file=".env",
     env_file_encoding="utf-8",

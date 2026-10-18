@@ -12,13 +12,13 @@ from sqlalchemy import (
   Uuid,
   func,
 )
+
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
 if TYPE_CHECKING:
   from app.db.project import Project
-
 
 class Environment(Base):
   __tablename__ = "environments"
@@ -29,7 +29,6 @@ class Environment(Base):
       name="uq_environments_project_name",
     ),
   )
-
   id: Mapped[uuid.UUID] = mapped_column(
     Uuid(as_uuid=True),
     primary_key=True,
@@ -58,7 +57,6 @@ class Environment(Base):
     server_default=func.now(),
     nullable=False,
   )
-
   project: Mapped["Project"] = relationship(
     "Project",
     back_populates="environments",

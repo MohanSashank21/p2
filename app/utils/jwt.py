@@ -1,18 +1,12 @@
-import uuid
+import uuid,jwt
 from datetime import datetime, timedelta, timezone
-import jwt
 from pydantic import SecretStr
 from app.core.config import settings
 
-def _secret_value(secret: SecretStr | None, name: str) -> str:
+def _get_secret(secret: SecretStr | None, name: str) -> str:
   if secret is None:
     raise RuntimeError(f"{name} is not configured")
-  
-  value = secret.get_secret_value()
-  if len(value) < 32:
-    raise RuntimeError(f"{name} must contain at least 32 characters")
-  return value
-
+  return secret.get_secret_value()
 
 def _create_token(
   user_id: uuid.UUID | str,
@@ -28,7 +22,7 @@ def _create_token(
   }
   return jwt.encode(
     payload,
-    _secret_value(secret, f"JWT_{token_type.upper()}_SECRET_KEY"),
+    _get_secret(secret, f"JWT_{token_type.upper()}_SECRET_KEY"),
     algorithm="HS256",
   )
 
@@ -39,16 +33,14 @@ def _verify_token(
 ) -> str:
   payload = jwt.decode(
     token,
-    _secret_value(secret, f"JWT_{token_type.upper()}_SECRET_KEY"),
+    _get_secret(secret, f"JWT_{token_type.upper()}_SECRET_KEY"),
     algorithms=["HS256"],
     options={"require": ["exp", "iat", "sub", "type"]},
   )
-
   if payload["type"] != token_type:
     raise jwt.InvalidTokenError(f"Token is not a {token_type} token")
 
   return payload["sub"]
-
 
 def create_access_token(user_id: uuid.UUID | str) -> str:
   expires_at = datetime.now(timezone.utc) + timedelta(
@@ -61,10 +53,8 @@ def create_access_token(user_id: uuid.UUID | str) -> str:
     expires_at,
   )
 
-
 def verify_access_token(token: str) -> str:
   return _verify_token(token, "access", settings.JWT_ACCESS_SECRET_KEY)
-
 
 def create_refresh_token(user_id: uuid.UUID | str) -> str:
   expires_at = datetime.now(timezone.utc) + timedelta(
@@ -76,7 +66,6 @@ def create_refresh_token(user_id: uuid.UUID | str) -> str:
     settings.JWT_REFRESH_SECRET_KEY,
     expires_at,
   )
-
 
 def verify_refresh_token(token: str) -> str:
   return _verify_token(token, "refresh", settings.JWT_REFRESH_SECRET_KEY)

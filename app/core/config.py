@@ -1,7 +1,6 @@
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Settings(BaseSettings):
   APP_NAME: str = "OpsPilot AI"
   APP_VERSION: str = "1.0.0"
@@ -17,6 +16,5 @@ class Settings(BaseSettings):
     env_file_encoding="utf-8",
     extra="ignore"
   )
-
 
 settings = Settings()

@@ -1,71 +1,117 @@
-import uuid,jwt
+import hashlib
+import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
+
+import jwt
 from pydantic import SecretStr
+
 from app.core.config import settings
+
+JWT_ISSUER = "opspilot"
+JWT_AUDIENCE = "opspilot-api"
+JWT_ALGORITHM = "HS256"
+
 
 def _get_secret(secret: SecretStr | None, name: str) -> str:
   if secret is None:
     raise RuntimeError(f"{name} is not configured")
-  return secret.get_secret_value()
+  value = secret.get_secret_value()
+  if len(value.encode("utf-8")) < 32:
+    raise RuntimeError(f"{name} must contain at least 32 bytes")
+  return value
 
-def _create_token(
+
+def _create_access_token(
   user_id: uuid.UUID | str,
-  token_type: str,
-  secret: SecretStr | None,
   expires_at: datetime,
 ) -> str:
+  now = datetime.now(timezone.utc)
   payload = {
     "sub": str(user_id),
-    "type": token_type,
-    "iat": datetime.now(timezone.utc),
+    "type": "access",
+    "jti": str(uuid.uuid4()),
+    "iat": now,
     "exp": expires_at,
+    "iss": JWT_ISSUER,
+    "aud": JWT_AUDIENCE,
   }
   return jwt.encode(
     payload,
-    _get_secret(secret, f"JWT_{token_type.upper()}_SECRET_KEY"),
-    algorithm="HS256",
+    _get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY"),
+    algorithm=JWT_ALGORITHM,
   )
 
-def _verify_token(
-  token: str,
-  token_type: str,
-  secret: SecretStr | None,
-) -> str:
+
+def verify_access_token(token: str) -> str:
   payload = jwt.decode(
     token,
-    _get_secret(secret, f"JWT_{token_type.upper()}_SECRET_KEY"),
-    algorithms=["HS256"],
-    options={"require": ["exp", "iat", "sub", "type"]},
+    _get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY"),
+    algorithms=[JWT_ALGORITHM],
+    issuer=JWT_ISSUER,
+    audience=JWT_AUDIENCE,
+    options={"require": ["exp", "iat", "sub", "jti", "type", "iss", "aud"]},
   )
-  if payload["type"] != token_type:
-    raise jwt.InvalidTokenError(f"Token is not a {token_type} token")
-
+  if payload["type"] != "access" or not isinstance(payload["jti"], str):
+    raise jwt.InvalidTokenError("Token is not an access token")
   return payload["sub"]
+
 
 def create_access_token(user_id: uuid.UUID | str) -> str:
   expires_at = datetime.now(timezone.utc) + timedelta(
     minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
   )
-  return _create_token(
-    user_id,
-    "access",
-    settings.JWT_ACCESS_SECRET_KEY,
-    expires_at,
-  )
+  return _create_access_token(user_id, expires_at)
 
-def verify_access_token(token: str) -> str:
-  return _verify_token(token, "access", settings.JWT_ACCESS_SECRET_KEY)
+
+def validate_access_token_configuration() -> None:
+  _get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY")
+
+
+def validate_auth_token_configuration() -> None:
+  _get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY")
+  _get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY")
+  secret = settings.OTP_HASH_SECRET_KEY
+  if secret is None or len(secret.get_secret_value().encode("utf-8")) < 32:
+    raise RuntimeError("OTP_HASH_SECRET_KEY must contain at least 32 bytes")
+
 
 def create_refresh_token(user_id: uuid.UUID | str) -> str:
-  expires_at = datetime.now(timezone.utc) + timedelta(
-    days=settings.REFRESH_TOKEN_EXPIRE_DAYS,
-  )
-  return _create_token(
-    user_id,
-    "refresh",
-    settings.JWT_REFRESH_SECRET_KEY,
-    expires_at,
+  now = datetime.now(timezone.utc)
+  payload = {
+    "sub": str(user_id),
+    "type": "refresh",
+    "jti": secrets.token_urlsafe(32),
+    "iat": now,
+    "exp": now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+    "iss": JWT_ISSUER,
+    "aud": JWT_AUDIENCE,
+  }
+  return jwt.encode(
+    payload,
+    _get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY"),
+    algorithm=JWT_ALGORITHM,
   )
 
-def verify_refresh_token(token: str) -> str:
-  return _verify_token(token, "refresh", settings.JWT_REFRESH_SECRET_KEY)
+
+def decode_refresh_token(token: str) -> tuple[str, datetime]:
+  payload = jwt.decode(
+    token,
+    _get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY"),
+    algorithms=[JWT_ALGORITHM],
+    issuer=JWT_ISSUER,
+    audience=JWT_AUDIENCE,
+    options={"require": ["exp", "iat", "sub", "jti", "type", "iss", "aud"]},
+  )
+  if (
+    payload["type"] != "refresh"
+    or not isinstance(payload["sub"], str)
+    or not isinstance(payload["jti"], str)
+  ):
+    raise jwt.InvalidTokenError("Token is not a refresh token")
+  expires = datetime.fromtimestamp(payload["exp"], timezone.utc)
+  return payload["sub"], expires
+
+
+def hash_refresh_token(token: str) -> str:
+  return hashlib.sha256(token.encode("utf-8")).hexdigest()

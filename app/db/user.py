@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, String, Uuid, func
+from sqlalchemy import Boolean, DateTime, String, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -34,6 +34,13 @@ class User(Base):
   
   password_hash: Mapped[str] = mapped_column(
     String(255),
+    nullable=False,
+  )
+
+  email_verified: Mapped[bool] = mapped_column(
+    Boolean,
+    default=False,
+    server_default="false",
     nullable=False,
   )
   

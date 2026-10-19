@@ -7,3 +7,4 @@ asyncpg
 PyJWT
 pwdlib[argon2]
 email-validator
+redis>=5,<7

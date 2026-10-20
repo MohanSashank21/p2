@@ -14,9 +14,7 @@ from sqlalchemy import (
 )
 
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-
 from app.db.base import Base
-
 if TYPE_CHECKING:
   from app.db.project import Project
 
@@ -29,11 +27,13 @@ class Environment(Base):
       name="uq_environments_project_name",
     ),
   )
+  
   id: Mapped[uuid.UUID] = mapped_column(
     Uuid(as_uuid=True),
     primary_key=True,
     default=uuid.uuid4,
   )
+  
   project_id: Mapped[uuid.UUID] = mapped_column(
     Uuid(as_uuid=True),
     ForeignKey("projects.id"),

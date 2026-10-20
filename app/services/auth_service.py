@@ -57,7 +57,7 @@ def _utc(value: datetime) -> datetime:
   return value.astimezone(timezone.utc)
 
 def _normalize_email(email: str) -> str:
-  return email.strip().casefold()
+  return email.strip().lower()
 
 async def _limit(
   redis: Redis,

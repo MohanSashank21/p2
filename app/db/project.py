@@ -20,6 +20,7 @@ from app.db.base import Base
 if TYPE_CHECKING:
   from app.db.environment import Environment
   from app.db.organisation import Organisation
+  from app.db.project_membership import ProjectMembership
 
 class Project(Base):
   __tablename__ = "projects"
@@ -28,6 +29,11 @@ class Project(Base):
       "organisation_id",
       "name",
       name="uq_projects_organisation_name",
+    ),
+    UniqueConstraint(
+      "id",
+      "organisation_id",
+      name="uq_projects_id_organisation",
     ),
   )
 
@@ -62,5 +68,9 @@ class Project(Base):
   )
   environments: Mapped[list["Environment"]] = relationship(
     "Environment",
+    back_populates="project",
+  )
+  memberships: Mapped[list["ProjectMembership"]] = relationship(
+    "ProjectMembership",
     back_populates="project",
   )

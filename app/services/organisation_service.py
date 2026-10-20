@@ -3,19 +3,20 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
-
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import (
-  BootstrapUnavailableError,
   EmailDeliveryError,
   InvitationTargetError,
+  OrganisationConflictError,
   PermissionDeniedError,
 )
-from app.db.auth import OrganisationInvitation, PlatformBootstrap
+
+from app.db.auth import OrganisationInvitation
 from app.db.membership import Membership
 from app.db.organisation import Organisation
 from app.db.user import User
@@ -26,38 +27,73 @@ from app.services.redis_service import bump_rate_limit
 
 INVITATION_EXPIRE_DAYS = 7
 
-
-def _hash_invitation_token(token: str) -> str:
-  return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-async def bootstrap_organisation(
+async def create_organisation(
   session: AsyncSession,
   user: User,
   name: str,
 ) -> Organisation:
-  state = await session.scalar(
-    select(PlatformBootstrap)
-    .where(PlatformBootstrap.key == "platform")
-    .with_for_update()
-  )
-  if state is None or state.completed_at is not None:
-    raise BootstrapUnavailableError("Platform bootstrap is unavailable")
-
-  organisation = Organisation(name=name)
-  session.add(organisation)
-  await session.flush()
-  session.add(
-    Membership(
-      organisation_id=organisation.id,
-      user_id=user.id,
-      role="owner",
+  normalized_name = name.strip()
+  existing_organisation = await session.scalar(
+    select(Organisation.id).where(
+      func.lower(func.btrim(Organisation.name)) == normalized_name.lower(),
     ),
   )
-  state.completed_at = datetime.now(timezone.utc)
-  await session.commit()
-  return organisation
+  if existing_organisation is not None:
+    raise OrganisationConflictError(
+      "An organisation with this name already exists",
+    )
 
+  organisation = Organisation(
+    name=normalized_name,
+    owner_user_id=user.id,
+  )
+  session.add(organisation)
+  committed = False
+  try:
+    await session.flush()
+    session.add(
+      Membership(
+        organisation_id=organisation.id,
+        user_id=user.id,
+        role="owner",
+      ),
+    )
+    await session.flush()
+    await session.commit()
+    committed = True
+    return organisation
+  except IntegrityError as error:
+    constraint_name = getattr(
+      getattr(error.orig, "diag", None),
+      "constraint_name",
+      None,
+    )
+    if (
+      constraint_name == "uq_organisations_name_normalized"
+      or "uq_organisations_name_normalized" in str(error.orig)
+    ):
+      raise OrganisationConflictError(
+        "An organisation with this name already exists",
+      ) from error
+    raise
+  finally:
+    if not committed:
+      await session.rollback()
+
+async def list_user_organisations(
+  session: AsyncSession,
+  user: User,
+) -> list[tuple[Organisation, Membership]]:
+  result = await session.execute(
+    select(Organisation, Membership)
+    .join(Membership, Membership.organisation_id == Organisation.id)
+    .where(Membership.user_id == user.id)
+    .order_by(Organisation.name, Organisation.id),
+  )
+  return list(result)
+
+def _hash_invitation_token(token: str) -> str:
+  return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 async def create_organisation_invitation(
   redis: Redis,
@@ -66,11 +102,8 @@ async def create_organisation_invitation(
   organisation_id: uuid.UUID,
   request: OrganisationInvitationRequest,
   client_ip: str,
-  inviter_role: str,
 ) -> OrganisationInvitation | None:
-  email = str(request.email).strip().casefold()
-  if inviter_role == "admin" and request.role != "worker":
-    raise PermissionDeniedError("Admins may invite workers only")
+  email = str(request.email).strip().lower()
   await bump_rate_limit(
     redis,
     "invite:actor",
@@ -78,6 +111,7 @@ async def create_organisation_invitation(
     limit=20,
     window_seconds=int(timedelta(hours=1).total_seconds()),
   )
+
   if client_ip:
     await bump_rate_limit(
       redis,
@@ -85,17 +119,6 @@ async def create_organisation_invitation(
       client_ip,
       limit=50,
       window_seconds=int(timedelta(hours=1).total_seconds()),
-    )
-
-  invited_user = await session.scalar(
-    select(User).where(
-      User.email == email,
-      User.email_verified.is_(True),
-    ),
-  )
-  if invited_user is None:
-    raise InvitationTargetError(
-      "Invitations can only be sent to an existing verified account",
     )
 
   organization = await session.get(Organisation, organisation_id)
@@ -120,24 +143,29 @@ async def create_organisation_invitation(
       OrganisationInvitation.email == email,
       OrganisationInvitation.accepted_at.is_(None),
       OrganisationInvitation.expires_at > datetime.now(timezone.utc),
-    ),
+    ).with_for_update(),
   )
-  if pending_invitation is not None:
-    raise InvitationTargetError(
-      "An invitation is already pending for this user",
-    )
 
   raw_token = secrets.token_urlsafe(48)
-  invitation = OrganisationInvitation(
-    organisation_id=organisation_id,
-    invited_by_user_id=inviter.id,
-    email=email,
-    role=request.role,
-    token_hash=_hash_invitation_token(raw_token),
-    expires_at=datetime.now(timezone.utc)
-    + timedelta(days=INVITATION_EXPIRE_DAYS),
+  expires_at = datetime.now(timezone.utc) + timedelta(
+    days=INVITATION_EXPIRE_DAYS,
   )
-  session.add(invitation)
+  if pending_invitation is None:
+    invitation = OrganisationInvitation(
+      organisation_id=organisation_id,
+      invited_by_user_id=inviter.id,
+      email=email,
+      role=request.role,
+      token_hash=_hash_invitation_token(raw_token),
+      expires_at=expires_at,
+    )
+    session.add(invitation)
+  else:
+    invitation = pending_invitation
+    invitation.invited_by_user_id = inviter.id
+    invitation.role = request.role
+    invitation.token_hash = _hash_invitation_token(raw_token)
+    invitation.expires_at = expires_at
   await session.commit()
 
   accept_url = (
@@ -162,7 +190,6 @@ async def create_organisation_invitation(
     raise
   return invitation
 
-
 async def accept_organisation_invitation(
   session: AsyncSession,
   user: User,
@@ -179,7 +206,7 @@ async def accept_organisation_invitation(
     invitation is None
     or invitation.accepted_at is not None
     or _utc(invitation.expires_at) <= datetime.now(timezone.utc)
-    or invitation.email != user.email
+    or invitation.email.casefold() != user.email.casefold()
     or not user.email_verified
   ):
     raise PermissionDeniedError("Invitation is invalid or expired")

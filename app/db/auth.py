@@ -59,7 +59,7 @@ class OrganisationInvitation(Base):
   __tablename__ = "organisation_invitations"
   __table_args__ = (
     CheckConstraint(
-      "role IN ('admin', 'worker')",
+      "role = 'member'",
       name="ck_organisation_invitations_role",
     ),
   )
@@ -99,14 +99,4 @@ class OrganisationInvitation(Base):
     DateTime(timezone=True),
     server_default=func.now(),
     nullable=False,
-  )
-
-
-class PlatformBootstrap(Base):
-  __tablename__ = "platform_bootstrap"
-
-  key: Mapped[str] = mapped_column(String(32), primary_key=True)
-  completed_at: Mapped[datetime | None] = mapped_column(
-    DateTime(timezone=True),
-    nullable=True,
   )

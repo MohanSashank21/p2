@@ -13,7 +13,6 @@ class Settings(BaseSettings):
   JWT_ACCESS_SECRET_KEY: SecretStr | None = None
   JWT_REFRESH_SECRET_KEY: SecretStr | None = None
   OTP_HASH_SECRET_KEY: SecretStr | None = None
-  PLATFORM_BOOTSTRAP_TOKEN: SecretStr | None = None
   ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, ge=1, le=60)
   REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, ge=1, le=90)
   OTP_EXPIRE_MINUTES: int = Field(default=5, ge=1, le=30)

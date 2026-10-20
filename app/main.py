@@ -55,7 +55,7 @@ if settings.cors_origins:
     allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Platform-Bootstrap-Token"],
+    allow_headers=["Authorization", "Content-Type"],
   )
 
 

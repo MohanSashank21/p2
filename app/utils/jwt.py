@@ -2,7 +2,6 @@ import hashlib
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-
 import jwt
 from pydantic import SecretStr
 
@@ -12,8 +11,7 @@ JWT_ISSUER = "opspilot"
 JWT_AUDIENCE = "opspilot-api"
 JWT_ALGORITHM = "HS256"
 
-
-def _get_secret(secret: SecretStr | None, name: str) -> str:
+def get_secret(secret: SecretStr | None, name: str) -> str:
   if secret is None:
     raise RuntimeError(f"{name} is not configured")
   value = secret.get_secret_value()
@@ -21,8 +19,7 @@ def _get_secret(secret: SecretStr | None, name: str) -> str:
     raise RuntimeError(f"{name} must contain at least 32 bytes")
   return value
 
-
-def _create_access_token(
+def encode_access_token(
   user_id: uuid.UUID | str,
   expires_at: datetime,
 ) -> str:
@@ -38,15 +35,14 @@ def _create_access_token(
   }
   return jwt.encode(
     payload,
-    _get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY"),
+    get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY"),
     algorithm=JWT_ALGORITHM,
   )
-
 
 def verify_access_token(token: str) -> str:
   payload = jwt.decode(
     token,
-    _get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY"),
+    get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY"),
     algorithms=[JWT_ALGORITHM],
     issuer=JWT_ISSUER,
     audience=JWT_AUDIENCE,
@@ -56,21 +52,20 @@ def verify_access_token(token: str) -> str:
     raise jwt.InvalidTokenError("Token is not an access token")
   return payload["sub"]
 
-
 def create_access_token(user_id: uuid.UUID | str) -> str:
   expires_at = datetime.now(timezone.utc) + timedelta(
     minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES,
   )
-  return _create_access_token(user_id, expires_at)
+  return encode_access_token(user_id, expires_at)
 
 
 def validate_access_token_configuration() -> None:
-  _get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY")
+  get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY")
 
 
 def validate_auth_token_configuration() -> None:
-  _get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY")
-  _get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY")
+  get_secret(settings.JWT_ACCESS_SECRET_KEY, "JWT_ACCESS_SECRET_KEY")
+  get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY")
   secret = settings.OTP_HASH_SECRET_KEY
   if secret is None or len(secret.get_secret_value().encode("utf-8")) < 32:
     raise RuntimeError("OTP_HASH_SECRET_KEY must contain at least 32 bytes")
@@ -89,15 +84,14 @@ def create_refresh_token(user_id: uuid.UUID | str) -> str:
   }
   return jwt.encode(
     payload,
-    _get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY"),
+    get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY"),
     algorithm=JWT_ALGORITHM,
   )
-
 
 def decode_refresh_token(token: str) -> tuple[str, datetime]:
   payload = jwt.decode(
     token,
-    _get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY"),
+    get_secret(settings.JWT_REFRESH_SECRET_KEY, "JWT_REFRESH_SECRET_KEY"),
     algorithms=[JWT_ALGORITHM],
     issuer=JWT_ISSUER,
     audience=JWT_AUDIENCE,

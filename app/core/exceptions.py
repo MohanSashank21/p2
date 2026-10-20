@@ -13,11 +13,20 @@ class InvalidOTPError(Exception):
 class InvalidRefreshTokenError(Exception):
   pass
 
-class BootstrapUnavailableError(Exception):
-  pass
-
 class PermissionDeniedError(Exception):
   pass
 
 class InvitationTargetError(Exception):
+  pass
+
+class OrganisationConflictError(Exception):
+  pass
+
+class ProjectTargetError(Exception):
+  pass
+
+class ProjectNotFoundError(Exception):
+  pass
+
+class ProjectConflictError(Exception):
   pass

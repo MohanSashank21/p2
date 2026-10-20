@@ -6,12 +6,10 @@ from email.message import EmailMessage
 from app.core.config import settings
 from app.core.exceptions import EmailDeliveryError
 
-
-def _send_message(server: smtplib.SMTP, message: EmailMessage) -> None:
+def send_message(server: smtplib.SMTP, message: EmailMessage) -> None:
   refused_recipients = server.send_message(message)
   if refused_recipients:
     raise EmailDeliveryError("Could not deliver email")
-
 
 def send_email_sync(recipient: str, subject: str, body: str) -> None:
   if not settings.SMTP_HOST or not settings.SMTP_FROM:
@@ -40,7 +38,7 @@ def send_email_sync(recipient: str, subject: str, body: str) -> None:
             settings.SMTP_USER,
             settings.SMTP_PASSWORD.get_secret_value(),
           )
-        _send_message(server, message)
+        send_message(server, message)
       return
 
     with smtplib.SMTP(
@@ -56,7 +54,7 @@ def send_email_sync(recipient: str, subject: str, body: str) -> None:
           settings.SMTP_USER,
           settings.SMTP_PASSWORD.get_secret_value(),
         )
-      _send_message(server, message)
+      send_message(server, message)
   except (OSError, smtplib.SMTPException) as error:
     raise EmailDeliveryError("Could not deliver email") from error
 

@@ -1,4 +1,13 @@
-from app.db import auth, environment, membership, organisation, project, user
+from app.db import (
+    auth,
+    environment,
+    membership,
+    organisation,
+    project,
+    project_invitation,
+    project_membership,
+    user,
+)
 
 __all__ = [
     'auth',
@@ -6,5 +15,7 @@ __all__ = [
     'membership',
     'organisation',
     'project',
+    'project_invitation',
+    'project_membership',
     'user',
 ]

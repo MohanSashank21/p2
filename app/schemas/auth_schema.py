@@ -1,10 +1,8 @@
 import uuid
 from typing import Literal
-
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-
-def _validate_password(password: str) -> str:
+def validate_password(password: str) -> str:
   if not any(character.isupper() for character in password):
     raise ValueError("Password must contain an uppercase letter")
   if not any(character.islower() for character in password):
@@ -17,7 +15,6 @@ def _validate_password(password: str) -> str:
   ):
     raise ValueError("Password must contain a special character")
   return password
-
 
 class RegisterRequest(BaseModel):
   email: EmailStr
@@ -35,53 +32,43 @@ class RegisterRequest(BaseModel):
   @field_validator("password")
   @classmethod
   def validate_password(cls, password: str) -> str:
-    return _validate_password(password)
-
+    return validate_password(password)
 
 class OTPRequest(BaseModel):
   email: EmailStr
 
-
 class LoginRequest(OTPRequest):
   password: str = Field(min_length=8, max_length=128)
 
-
 class OTPVerifyRequest(OTPRequest):
   code: str = Field(pattern=r"^\d{6}$")
-
 
 class OTPResendRequest(OTPRequest):
   purpose: Literal["register", "login", "reset"]
 
   @field_validator("purpose", mode="before")
   @classmethod
-  def normalize_purpose(cls, purpose: str) -> str:
+  def normalize_purpose(cls, purpose: object) -> object:
     aliases = {
       "registration": "register",
       "password_reset": "reset",
-      "password-reset": "reset",
       "forgot_password": "reset",
-      "forgot-password": "reset",
     }
     if isinstance(purpose, str):
-      return aliases.get(purpose.strip().casefold(), purpose.strip().casefold())
+      return aliases.get(purpose, purpose)
     return purpose
-
 
 class PasswordResetCompleteRequest(BaseModel):
   reset_token: str = Field(min_length=32, max_length=200)
   new_password: str = Field(min_length=8, max_length=128)
-
   @field_validator("new_password")
   @classmethod
   def validate_new_password(cls, password: str) -> str:
-    return _validate_password(password)
-
+    return validate_password(password)
 
 class PasswordResetVerifiedResponse(BaseModel):
   reset_token: str
   expires_in: int
-
 
 class PasswordChangeRequest(BaseModel):
   current_password: str = Field(min_length=1, max_length=128)
@@ -90,12 +77,10 @@ class PasswordChangeRequest(BaseModel):
   @field_validator("new_password")
   @classmethod
   def validate_new_password(cls, password: str) -> str:
-    return _validate_password(password)
-
+    return validate_password(password)
 
 class OTPChallengeResponse(BaseModel):
   message: str
-
 
 class TokenResponse(BaseModel):
   access_token: str
@@ -109,44 +94,21 @@ class UserResponse(BaseModel):
   display_name: str
   email_verified: bool
 
-
 class OrganisationMembershipResponse(BaseModel):
   id: uuid.UUID
   name: str
-  role: Literal["owner", "admin", "worker"]
-
+  role: Literal["owner", "member"]
 
 class CurrentUserResponse(UserResponse):
   organisations: list[OrganisationMembershipResponse]
 
-
-class OrganisationBootstrapRequest(BaseModel):
-  name: str = Field(min_length=1, max_length=120)
-
-  @field_validator("name")
-  @classmethod
-  def validate_name(cls, name: str) -> str:
-    name = name.strip()
-    if not name:
-      raise ValueError("Organisation name cannot be blank")
-    return name
-
-
-class OrganisationBootstrapResponse(BaseModel):
-  organisation_id: uuid.UUID
-  name: str
-  role: Literal["owner"] = "owner"
-
-
 class OrganisationInvitationRequest(BaseModel):
   email: EmailStr
-  role: Literal["admin", "worker"]
-
+  role: Literal["member"]
 
 class OrganisationInvitationResponse(BaseModel):
   message: str
   expires_in: int
-
 
 class OrganisationInvitationAcceptRequest(BaseModel):
   token: str = Field(min_length=32, max_length=200)

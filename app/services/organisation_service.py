@@ -1,16 +1,12 @@
 import hashlib
-import secrets
 import uuid
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
+from datetime import datetime, timezone
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import settings
 from app.core.exceptions import (
-  EmailDeliveryError,
   InvitationTargetError,
   OrganisationConflictError,
   PermissionDeniedError,
@@ -23,7 +19,9 @@ from app.db.user import User
 from app.schemas.auth_schema import OrganisationInvitationRequest
 from app.services.auth_service import _utc
 from app.services.email_service import send_email
-from app.services.redis_service import bump_rate_limit
+from app.services.invitation_service import lock_invitation_target
+from app.services.outbox_service import enqueue_invitation_email
+from app.services.redis_service import rate_limit_invitation
 
 INVITATION_EXPIRE_DAYS = 7
 
@@ -104,26 +102,22 @@ async def create_organisation_invitation(
   client_ip: str,
 ) -> OrganisationInvitation | None:
   email = str(request.email).strip().lower()
-  await bump_rate_limit(
+  await rate_limit_invitation(
     redis,
-    "invite:actor",
+    "organisation-invite",
     str(inviter.id),
-    limit=20,
-    window_seconds=int(timedelta(hours=1).total_seconds()),
+    email,
+    client_ip,
   )
-
-  if client_ip:
-    await bump_rate_limit(
-      redis,
-      "invite:ip",
-      client_ip,
-      limit=50,
-      window_seconds=int(timedelta(hours=1).total_seconds()),
-    )
 
   organization = await session.get(Organisation, organisation_id)
   if organization is None:
     return None
+  await lock_invitation_target(
+    session,
+    "organisation",
+    f"{organisation_id}:{email.lower()}",
+  )
   existing_membership = await session.scalar(
     select(Membership)
     .join(User, Membership.user_id == User.id)
@@ -140,54 +134,41 @@ async def create_organisation_invitation(
   pending_invitation = await session.scalar(
     select(OrganisationInvitation).where(
       OrganisationInvitation.organisation_id == organisation_id,
-      OrganisationInvitation.email == email,
+      func.lower(OrganisationInvitation.email) == email.lower(),
       OrganisationInvitation.accepted_at.is_(None),
-      OrganisationInvitation.expires_at > datetime.now(timezone.utc),
     ).with_for_update(),
   )
 
-  raw_token = secrets.token_urlsafe(48)
-  expires_at = datetime.now(timezone.utc) + timedelta(
-    days=INVITATION_EXPIRE_DAYS,
-  )
   if pending_invitation is None:
     invitation = OrganisationInvitation(
       organisation_id=organisation_id,
       invited_by_user_id=inviter.id,
       email=email,
       role=request.role,
-      token_hash=_hash_invitation_token(raw_token),
-      expires_at=expires_at,
+      token_hash="pending",
+      expires_at=datetime.now(timezone.utc),
     )
     session.add(invitation)
   else:
     invitation = pending_invitation
     invitation.invited_by_user_id = inviter.id
     invitation.role = request.role
-    invitation.token_hash = _hash_invitation_token(raw_token)
-    invitation.expires_at = expires_at
-  await session.commit()
-
-  accept_url = (
-    f"{settings.FRONTEND_BASE_URL.rstrip('/')}/accept-invitation?"
-    f"{urlencode({'token': raw_token})}"
+  await enqueue_invitation_email(
+    session,
+    invitation,
+    invitation_type="organisation",
+    recipient=email,
+    subject=f"Invitation to {organization.name}",
+    message=(
+      f"You have been invited to join {organization.name} as a "
+      f"{request.role}."
+    ),
+    accept_path="/accept-invitation",
+    target_scope="organisation",
+    target_key=f"{organisation_id}:{email.lower()}",
+    expiry_days=INVITATION_EXPIRE_DAYS,
+    sender=send_email,
   )
-  try:
-    await send_email(
-      email,
-      f"Invitation to {organization.name}",
-      (
-        f"You have been invited to join {organization.name} as a "
-        f"{request.role}.\n\n"
-        f"Sign in or create a verified account with this email, then accept "
-        f"the invitation here:\n{accept_url}\n\n"
-        f"This invitation expires in {INVITATION_EXPIRE_DAYS} days."
-      ),
-    )
-  except EmailDeliveryError:
-    invitation.expires_at = datetime.now(timezone.utc)
-    await session.commit()
-    raise
   return invitation
 
 async def accept_organisation_invitation(
@@ -195,15 +176,28 @@ async def accept_organisation_invitation(
   user: User,
   raw_token: str,
 ) -> Membership:
-  invitation = await session.scalar(
+  candidate = await session.scalar(
     select(OrganisationInvitation)
     .where(
       OrganisationInvitation.token_hash == _hash_invitation_token(raw_token),
-    )
+    ),
+  )
+  if candidate is None:
+    raise PermissionDeniedError("Invitation is invalid or expired")
+  await lock_invitation_target(
+    session,
+    "organisation",
+    f"{candidate.organisation_id}:{candidate.email.lower()}",
+  )
+  invitation = await session.scalar(
+    select(OrganisationInvitation)
+    .where(OrganisationInvitation.id == candidate.id)
     .with_for_update()
+    .execution_options(populate_existing=True),
   )
   if (
     invitation is None
+    or invitation.token_hash != _hash_invitation_token(raw_token)
     or invitation.accepted_at is not None
     or _utc(invitation.expires_at) <= datetime.now(timezone.utc)
     or invitation.email.casefold() != user.email.casefold()

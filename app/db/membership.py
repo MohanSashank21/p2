@@ -1,8 +1,6 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
-
 from sqlalchemy import (
   CheckConstraint,
   DateTime,
@@ -15,11 +13,8 @@ from sqlalchemy import (
   text,
 )
 
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
-if TYPE_CHECKING:
-  from app.db.organisation import Organisation
-  from app.db.user import User
 
 class Membership(Base):
   __tablename__ = "memberships"
@@ -67,12 +62,4 @@ class Membership(Base):
     DateTime(timezone=True),
     server_default=func.now(),
     nullable=False,
-  )
-  organisation: Mapped["Organisation"] = relationship(
-    "Organisation",
-    back_populates="memberships",
-  )
-  user: Mapped["User"] = relationship(
-    "User",
-    back_populates="memberships",
   )

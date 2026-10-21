@@ -10,7 +10,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
-  from app.db.membership import Membership
   from app.db.project_membership import ProjectMembership
 
 class User(Base):
@@ -44,10 +43,6 @@ class User(Base):
     DateTime(timezone=True),
     server_default=func.now(),
     nullable=False,
-  )
-  memberships: Mapped[list["Membership"]] = relationship(
-    "Membership",
-    back_populates="user",
   )
   project_memberships: Mapped[list["ProjectMembership"]] = relationship(
     "ProjectMembership",

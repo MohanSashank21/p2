@@ -16,8 +16,8 @@ from app.core.exceptions import (
 from app.db.auth import RefreshSession
 from app.db.database import get_db
 from app.db.redis import get_redis
-from app.db.membership import Membership
-from app.db.organisation import Organisation
+from app.db.project import Project
+from app.db.project_membership import ProjectMembership
 from app.db.user import User
 from app.schemas.auth_schema import (
   LoginRequest,
@@ -27,6 +27,7 @@ from app.schemas.auth_schema import (
   OTPVerifyRequest,
   RegisterRequest,
   CurrentUserResponse,
+  CurrentUserProjectResponse,
   TokenResponse,
   PasswordChangeRequest,
   PasswordResetCompleteRequest,
@@ -445,22 +446,22 @@ async def get_me(
   session: AsyncSession = Depends(get_db),
 ) -> CurrentUserResponse:
   memberships = await session.execute(
-    select(Membership, Organisation)
-    .join(Organisation, Membership.organisation_id == Organisation.id)
-    .where(Membership.user_id == user.id)
-    .order_by(Organisation.name)
+    select(ProjectMembership, Project)
+    .join(Project, ProjectMembership.project_id == Project.id)
+    .where(ProjectMembership.user_id == user.id)
+    .order_by(Project.name, Project.id)
   )
   return CurrentUserResponse(
     id=user.id,
     email=user.email,
     display_name=user.display_name,
     email_verified=user.email_verified,
-    organisations=[
+    projects=[
       {
-        "id": membership.organisation_id,
-        "name": organisation.name,
+        "id": project.id,
+        "name": project.name,
         "role": membership.role,
       }
-      for membership, organisation in memberships
+      for membership, project in memberships
     ],
   )

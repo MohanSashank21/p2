@@ -7,14 +7,17 @@ from typing import TYPE_CHECKING
 from sqlalchemy import (
   CheckConstraint,
   DateTime,
-  ForeignKeyConstraint,
+  ForeignKey,
+  Index,
   String,
   UniqueConstraint,
   Uuid,
   func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from app.db.base import Base
+
 if TYPE_CHECKING:
   from app.db.project import Project
   from app.db.user import User
@@ -29,27 +32,11 @@ class ProjectMembership(Base):
       name="uq_project_memberships_project_user",
     ),
     CheckConstraint(
-      "role IN ('manager', 'worker')",
+      "role IN ('owner', 'member')",
       name="ck_project_memberships_role",
     ),
-    ForeignKeyConstraint(
-      ["project_id", "organisation_id"],
-      ["projects.id", "projects.organisation_id"],
-      name="fk_project_memberships_project_organisation",
-      ondelete="CASCADE",
-    ),
-    ForeignKeyConstraint(
-      ["organisation_id", "user_id"],
-      ["memberships.organisation_id", "memberships.user_id"],
-      name="fk_project_memberships_organisation_user",
-      ondelete="CASCADE",
-    ),
-    ForeignKeyConstraint(
-      ["user_id"],
-      ["users.id"],
-      name="fk_project_memberships_user",
-      ondelete="CASCADE",
-    ),
+    Index("ix_project_memberships_project_id", "project_id"),
+    Index("ix_project_memberships_user_id", "user_id"),
   )
 
   id: Mapped[uuid.UUID] = mapped_column(
@@ -59,17 +46,13 @@ class ProjectMembership(Base):
   )
   project_id: Mapped[uuid.UUID] = mapped_column(
     Uuid(as_uuid=True),
-    nullable=False,
-    index=True,
-  )
-  organisation_id: Mapped[uuid.UUID] = mapped_column(
-    Uuid(as_uuid=True),
+    ForeignKey("projects.id", ondelete="CASCADE"),
     nullable=False,
   )
   user_id: Mapped[uuid.UUID] = mapped_column(
     Uuid(as_uuid=True),
+    ForeignKey("users.id", ondelete="CASCADE"),
     nullable=False,
-    index=True,
   )
   role: Mapped[str] = mapped_column(
     String(20),

@@ -80,13 +80,12 @@ async def list_mine(
     )
     for organisation, membership in memberships
   ]
-
+  
 @router.post(
   "/{organisation_id}/invitations",
   response_model=OrganisationInvitationResponse,
   status_code=status.HTTP_202_ACCEPTED,
 )
-
 async def invite_to_organisation(
   organisation_id: uuid.UUID,
   request: OrganisationInvitationRequest,
@@ -129,7 +128,9 @@ async def invite_to_organisation(
       detail="Invitation email could not be delivered",
     ) from error
   return OrganisationInvitationResponse(
-    message="Invitation email sent.",
+    message=(
+      "Invitation email queued for delivery; inbox delivery is not confirmed."
+    ),
     expires_in=INVITATION_EXPIRE_DAYS * 24 * 60 * 60,
   )
 

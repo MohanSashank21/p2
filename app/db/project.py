@@ -19,17 +19,11 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
   from app.db.environment import Environment
-  from app.db.organisation import Organisation
   from app.db.project_membership import ProjectMembership
 
 class Project(Base):
   __tablename__ = "projects"
   __table_args__ = (
-    UniqueConstraint(
-      "organisation_id",
-      "name",
-      name="uq_projects_organisation_name",
-    ),
     UniqueConstraint(
       "id",
       "organisation_id",
@@ -42,10 +36,11 @@ class Project(Base):
     primary_key=True,
     default=uuid.uuid4,
   )
-  organisation_id: Mapped[uuid.UUID] = mapped_column(
+  legacy_organisation_id: Mapped[uuid.UUID | None] = mapped_column(
+    "organisation_id",
     Uuid(as_uuid=True),
     ForeignKey("organisations.id"),
-    nullable=False,
+    nullable=True,
     index=True,
   )
   name: Mapped[str] = mapped_column(
@@ -62,15 +57,15 @@ class Project(Base):
     nullable=False,
   )
 
-  organisation: Mapped["Organisation"] = relationship(
-    "Organisation",
-    back_populates="projects",
-  )
   environments: Mapped[list["Environment"]] = relationship(
     "Environment",
     back_populates="project",
+    cascade="all, delete-orphan",
+    passive_deletes=True,
   )
   memberships: Mapped[list["ProjectMembership"]] = relationship(
     "ProjectMembership",
     back_populates="project",
+    cascade="all, delete-orphan",
+    passive_deletes=True,
   )

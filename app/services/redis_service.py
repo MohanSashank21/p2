@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import secrets
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from redis.asyncio import Redis
 
@@ -94,6 +94,18 @@ redis.call('DEL', KEYS[1])
 return user_id
 """
 
+InvitationAction = Literal[
+  "organisation-invite",
+  "project-manager-invite",
+  "project-worker-invite",
+]
+
+INVITATION_RATE_LIMITS: dict[InvitationAction, dict[str, int]] = {
+  "organisation-invite": {"actor": 20, "recipient": 5, "ip": 50},
+  "project-manager-invite": {"actor": 20, "recipient": 5, "ip": 50},
+  "project-worker-invite": {"actor": 20, "recipient": 5, "ip": 50},
+}
+
 
 def _key(scope: str, subject: str) -> str:
   secret = settings.OTP_HASH_SECRET_KEY
@@ -109,6 +121,39 @@ def _key(scope: str, subject: str) -> str:
 
 def _normalize_email(email: str) -> str:
   return email.strip().casefold()
+
+
+async def rate_limit_invitation(
+  client: Redis,
+  action: InvitationAction,
+  inviter_id: str,
+  invitee_email: str,
+  client_ip: str,
+) -> None:
+  limits = INVITATION_RATE_LIMITS[action]
+  window_seconds = 3600
+  await bump_rate_limit(
+    client,
+    f"{action}:actor",
+    inviter_id,
+    limit=limits["actor"],
+    window_seconds=window_seconds,
+  )
+  await bump_rate_limit(
+    client,
+    f"{action}:recipient",
+    _normalize_email(invitee_email),
+    limit=limits["recipient"],
+    window_seconds=window_seconds,
+  )
+  if client_ip:
+    await bump_rate_limit(
+      client,
+      f"{action}:ip",
+      client_ip,
+      limit=limits["ip"],
+      window_seconds=window_seconds,
+    )
 
 
 def _hash_otp(email: str, purpose: str, challenge_id: str, code: str) -> str:

@@ -8,9 +8,11 @@ from sqlalchemy import (
   DateTime,
   ForeignKey,
   ForeignKeyConstraint,
+  Index,
   String,
   Uuid,
   func,
+  text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -42,12 +44,6 @@ class ProjectInvitation(Base):
       name="ck_project_invitations_acceptance_state",
     ),
     ForeignKeyConstraint(
-      ["organisation_id", "invitee_user_id"],
-      ["memberships.organisation_id", "memberships.user_id"],
-      name="fk_project_invitations_organisation_invitee",
-      ondelete="CASCADE",
-    ),
-    ForeignKeyConstraint(
       ["project_id", "organisation_id"],
       ["projects.id", "projects.organisation_id"],
       name="fk_project_invitations_project_organisation",
@@ -58,6 +54,23 @@ class ProjectInvitation(Base):
       ["projects.id", "projects.organisation_id"],
       name="fk_project_invitations_accepted_project_organisation",
       ondelete="CASCADE",
+    ),
+    Index("ix_project_invitations_invitee_email", "invitee_email"),
+    Index(
+      "uq_project_invitations_pending_manager",
+      "organisation_id",
+      "proposed_project_name",
+      unique=True,
+      postgresql_where=text("role = 'manager' AND accepted_at IS NULL"),
+      sqlite_where=text("role = 'manager' AND accepted_at IS NULL"),
+    ),
+    Index(
+      "uq_project_invitations_pending_worker",
+      "project_id",
+      text("lower(invitee_email)"),
+      unique=True,
+      postgresql_where=text("role = 'worker' AND accepted_at IS NULL"),
+      sqlite_where=text("role = 'worker' AND accepted_at IS NULL"),
     ),
   )
 
@@ -86,10 +99,9 @@ class ProjectInvitation(Base):
     ForeignKey("users.id", ondelete="CASCADE"),
     nullable=False,
   )
-  invitee_user_id: Mapped[uuid.UUID] = mapped_column(
-    Uuid(as_uuid=True),
+  invitee_email: Mapped[str] = mapped_column(
+    String(320),
     nullable=False,
-    index=True,
   )
   role: Mapped[str] = mapped_column(
     String(20),

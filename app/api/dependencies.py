@@ -53,8 +53,10 @@ async def get_current_user(
   return user
 
 
-def require_organisation_role( *allowed_roles: str) -> Callable:
-  async def require_role(organisation_id: uuid.UUID, current_user: User = Depends(get_current_user),
+def require_organisation_role(*allowed_roles: str) -> Callable:
+  async def require_role(
+    organisation_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
   ) -> Membership:
     membership = await session.scalar(

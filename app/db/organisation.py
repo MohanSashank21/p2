@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING
 from sqlalchemy import DateTime, Index, String, Uuid, func
 from sqlalchemy import ForeignKey
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
-
-if TYPE_CHECKING:
-  from app.db.membership import Membership
-  from app.db.project import Project
 
 class Organisation(Base):
   __tablename__ = "organisations"
@@ -42,14 +37,4 @@ class Organisation(Base):
     DateTime(timezone=True),
     server_default=func.now(),
     nullable=False,
-  )
-
-  memberships: Mapped[list["Membership"]] = relationship(
-    "Membership",
-    back_populates="organisation",
-  )
-
-  projects: Mapped[list["Project"]] = relationship(
-    "Project",
-    back_populates="organisation",
   )

@@ -1,5 +1,6 @@
 from app.db import (
     auth,
+    email_outbox,
     environment,
     membership,
     organisation,
@@ -11,6 +12,7 @@ from app.db import (
 
 __all__ = [
     'auth',
+    'email_outbox',
     'environment',
     'membership',
     'organisation',

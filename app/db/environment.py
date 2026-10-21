@@ -36,7 +36,7 @@ class Environment(Base):
   
   project_id: Mapped[uuid.UUID] = mapped_column(
     Uuid(as_uuid=True),
-    ForeignKey("projects.id"),
+    ForeignKey("projects.id", ondelete="CASCADE"),
     nullable=False,
     index=True,
   )

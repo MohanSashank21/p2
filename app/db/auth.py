@@ -5,9 +5,11 @@ from sqlalchemy import (
   CheckConstraint,
   DateTime,
   ForeignKey,
+  Index,
   String,
   Uuid,
   func,
+  text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
@@ -61,6 +63,14 @@ class OrganisationInvitation(Base):
     CheckConstraint(
       "role = 'member'",
       name="ck_organisation_invitations_role",
+    ),
+    Index(
+      "uq_organisation_invitations_pending_target",
+      "organisation_id",
+      text("lower(email)"),
+      unique=True,
+      postgresql_where=text("accepted_at IS NULL"),
+      sqlite_where=text("accepted_at IS NULL"),
     ),
   )
 

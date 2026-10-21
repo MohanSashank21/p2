@@ -1,7 +1,6 @@
 import os
 import secrets
 import uuid
-from urllib.parse import parse_qs, urlparse
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite://")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379")
@@ -12,13 +11,13 @@ os.environ.setdefault("OTP_HASH_SECRET_KEY", "test-otp-hmac-secret-not-for-produ
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from redis.asyncio import Redis
 from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db import (
   auth,
+  email_outbox,
   environment,
   membership,
   organisation,
@@ -29,15 +28,12 @@ from app.db import (
 )
 from app.db.base import Base
 from app.db.database import get_db
-from app.db.membership import Membership
-from app.db.organisation import Organisation
+from app.db.environment import Environment
 from app.db.project import Project
 from app.db.project_membership import ProjectMembership
-from app.db.user import User
 from app.db.redis import get_redis
+from app.db.user import User
 from app.main import app
-from app.services import project_service
-from app.services.organisation_service import create_organisation
 from app.utils.jwt import create_access_token
 
 
@@ -46,7 +42,7 @@ def _email() -> str:
 
 
 @pytest_asyncio.fixture
-async def project_client(tmp_path, monkeypatch):
+async def project_client(tmp_path):
   engine = create_async_engine(
     f"sqlite+aiosqlite:///{tmp_path / 'projects.sqlite3'}",
   )
@@ -71,23 +67,6 @@ async def project_client(tmp_path, monkeypatch):
     class_=AsyncSession,
     expire_on_commit=False,
   )
-  redis = Redis.from_url(
-    os.environ["REDIS_URL"],
-    db=15,
-    encoding="utf-8",
-    decode_responses=True,
-    socket_connect_timeout=2,
-    socket_timeout=2,
-  )
-  await redis.ping()
-  sent_emails: list[tuple[str, str, str]] = []
-
-  async def fake_send_email(
-    recipient: str,
-    subject: str,
-    body: str,
-  ) -> None:
-    sent_emails.append((recipient, subject, body))
 
   async def override_database():
     async with session_factory() as session:
@@ -95,8 +74,7 @@ async def project_client(tmp_path, monkeypatch):
 
   original_overrides = app.dependency_overrides.copy()
   app.dependency_overrides[get_db] = override_database
-  app.dependency_overrides[get_redis] = lambda: redis
-  monkeypatch.setattr(project_service, "send_email", fake_send_email)
+  app.dependency_overrides.pop(get_redis, None)
 
   transport = ASGITransport(
     app=app,
@@ -106,11 +84,10 @@ async def project_client(tmp_path, monkeypatch):
     transport=transport,
     base_url="http://testserver",
   ) as client:
-    yield client, session_factory, sent_emails
+    yield client, session_factory
 
   app.dependency_overrides.clear()
   app.dependency_overrides.update(original_overrides)
-  await redis.aclose()
   await engine.dispose()
 
 
@@ -118,445 +95,263 @@ async def _create_user(
   session_factory: async_sessionmaker[AsyncSession],
 ) -> User:
   async with session_factory() as session:
-    user = User(
+    created = User(
       email=_email(),
       display_name="Project Test",
       password_hash="unused-test-hash",
       email_verified=True,
     )
-    session.add(user)
+    session.add(created)
     await session.commit()
-    return user
-
-
-async def _create_organisation(
-  session_factory: async_sessionmaker[AsyncSession],
-  owner: User,
-  name: str = "Project organization",
-) -> Organisation:
-  async with session_factory() as session:
-    return await create_organisation(session, owner, name)
-
-
-async def _add_organisation_member(
-  session_factory: async_sessionmaker[AsyncSession],
-  organisation_id: uuid.UUID,
-  member: User,
-) -> None:
-  async with session_factory() as session:
-    session.add(
-      Membership(
-        organisation_id=organisation_id,
-        user_id=member.id,
-        role="member",
-      ),
-    )
-    await session.commit()
+    return created
 
 
 def _auth_headers(user: User) -> dict[str, str]:
   return {"Authorization": f"Bearer {create_access_token(user.id)}"}
 
 
-def _invitation_token(sent_emails: list[tuple[str, str, str]]) -> str:
-  assert sent_emails
-  accept_url = next(
-    line
-    for line in sent_emails[-1][2].splitlines()
-    if "accept-project-invitation?" in line
-  )
-  query = urlparse(accept_url).query
-  return parse_qs(query)["token"][0]
-
-
-async def _propose_project(
+async def _create_project(
   client: AsyncClient,
-  organisation_id: uuid.UUID,
-  owner: User,
-  manager: User,
-  name: str = "Project A",
+  user: User,
+  name: str,
 ):
   return await client.post(
-    f"/organisations/{organisation_id}/projects",
-    json={
-      "name": name,
-      "description": "Project description",
-      "manager_user_id": str(manager.id),
-    },
-    headers=_auth_headers(owner),
+    "/projects",
+    json={"name": name, "description": f"{name} description"},
+    headers=_auth_headers(user),
   )
 
 
 @pytest.mark.asyncio
-async def test_project_is_created_only_after_manager_accepts(project_client):
-  client, session_factory, sent_emails = project_client
+async def test_project_creator_becomes_owner_and_projects_are_top_level(
+  project_client,
+):
+  client, session_factory = project_client
   owner = await _create_user(session_factory)
-  manager = await _create_user(session_factory)
-  organisation = await _create_organisation(session_factory, owner)
-  await _add_organisation_member(session_factory, organisation.id, manager)
 
-  invitation = await _propose_project(
-    client,
-    organisation.id,
-    owner,
-    manager,
-  )
-  assert invitation.status_code == 202
-  assert sent_emails[-1][0] == manager.email
+  response = await _create_project(client, owner, "  Project A  ")
+
+  assert response.status_code == 201
+  payload = response.json()
+  assert payload["name"] == "Project A"
+  assert payload["role"] == "owner"
+  assert "organisation_id" not in payload
 
   async with session_factory() as session:
-    assert await session.scalar(select(Project.id)) is None
-
-  accepted = await client.post(
-    "/project-invitations/accept",
-    json={"token": _invitation_token(sent_emails)},
-    headers=_auth_headers(manager),
-  )
-  assert accepted.status_code == 200
-  project_response = accepted.json()
-  assert project_response["name"] == "Project A"
-  assert project_response["role"] == "manager"
-
-  async with session_factory() as session:
-    saved_project = await session.get(
-      Project,
-      uuid.UUID(project_response["id"]),
-    )
-    saved_membership = await session.scalar(
+    saved_project = await session.get(Project, uuid.UUID(payload["id"]))
+    membership = await session.scalar(
       select(ProjectMembership).where(
-        ProjectMembership.project_id == uuid.UUID(project_response["id"]),
-        ProjectMembership.user_id == manager.id,
+        ProjectMembership.project_id == uuid.UUID(payload["id"]),
+        ProjectMembership.user_id == owner.id,
       ),
     )
 
   assert saved_project is not None
-  assert saved_membership is not None
-  assert saved_membership.role == "manager"
-
-  manager_projects = await client.get(
-    f"/organisations/{organisation.id}/projects",
-    headers=_auth_headers(manager),
-  )
-  owner_projects = await client.get(
-    f"/organisations/{organisation.id}/projects",
-    headers=_auth_headers(owner),
-  )
-  assert [item["id"] for item in manager_projects.json()] == [
-    project_response["id"],
-  ]
-  assert owner_projects.json()[0]["role"] == "owner"
+  assert saved_project.legacy_organisation_id is None
+  assert membership is not None
+  assert membership.role == "owner"
 
 
 @pytest.mark.asyncio
-async def test_one_user_can_hold_different_project_roles_and_org_owner(
-  project_client,
-):
-  client, session_factory, sent_emails = project_client
+async def test_user_can_create_and_list_multiple_projects(project_client):
+  client, session_factory = project_client
   owner = await _create_user(session_factory)
-  project_manager = await _create_user(session_factory)
-  organisation = await _create_organisation(session_factory, owner)
-  await _add_organisation_member(
-    session_factory,
-    organisation.id,
-    project_manager,
-  )
 
-  manager_proposal = await _propose_project(
-    client,
-    organisation.id,
-    owner,
-    owner,
-    "Managed project",
-  )
-  manager_acceptance = await client.post(
-    "/project-invitations/accept",
-    json={"token": _invitation_token(sent_emails)},
-    headers=_auth_headers(owner),
-  )
-  assert manager_proposal.status_code == 202
-  assert manager_acceptance.status_code == 200
-  assert manager_acceptance.json()["role"] == "manager"
+  first = await _create_project(client, owner, "First")
+  second = await _create_project(client, owner, "Second")
+  listed = await client.get("/projects", headers=_auth_headers(owner))
 
-  worker_proposal = await _propose_project(
-    client,
-    organisation.id,
-    owner,
-    project_manager,
-    "Worker project",
-  )
-  project_manager_acceptance = await client.post(
-    "/project-invitations/accept",
-    json={"token": _invitation_token(sent_emails)},
-    headers=_auth_headers(project_manager),
-  )
-  assert worker_proposal.status_code == 202
-  assert project_manager_acceptance.status_code == 200
-  assert project_manager_acceptance.json()["role"] == "manager"
-
-  worker_invitation = await client.post(
-    f"/organisations/{organisation.id}/projects/{project_manager_acceptance.json()['id']}/worker-invitations",
-    json={"user_id": str(owner.id)},
-    headers=_auth_headers(project_manager),
-  )
-  assert worker_invitation.status_code == 202
-  worker_role_acceptance = await client.post(
-    "/project-invitations/accept",
-    json={"token": _invitation_token(sent_emails)},
-    headers=_auth_headers(owner),
-  )
-  assert worker_role_acceptance.status_code == 200
-  assert worker_role_acceptance.json()["role"] == "worker"
-
-  projects = await client.get(
-    f"/organisations/{organisation.id}/projects",
-    headers=_auth_headers(owner),
-  )
-  roles_by_name = {item["name"]: item["role"] for item in projects.json()}
-  assert roles_by_name == {
-    "Managed project": "manager",
-    "Worker project": "worker",
-  }
+  assert first.status_code == 201
+  assert second.status_code == 201
+  assert first.json()["id"] != second.json()["id"]
+  assert {item["name"] for item in listed.json()} == {"First", "Second"}
+  assert {item["role"] for item in listed.json()} == {"owner"}
 
 
 @pytest.mark.asyncio
-async def test_manager_invites_worker_to_project_and_worker_accepts(
-  project_client,
-):
-  client, session_factory, sent_emails = project_client
+async def test_projects_are_isolated_between_users(project_client):
+  client, session_factory = project_client
   owner = await _create_user(session_factory)
-  manager = await _create_user(session_factory)
-  worker = await _create_user(session_factory)
-  organisation = await _create_organisation(session_factory, owner)
-  for member in (manager, worker):
-    await _add_organisation_member(session_factory, organisation.id, member)
+  outsider = await _create_user(session_factory)
+  created = await _create_project(client, owner, "Private")
+  project_id = created.json()["id"]
 
-  proposed = await _propose_project(
-    client,
-    organisation.id,
-    owner,
-    manager,
+  listed = await client.get("/projects", headers=_auth_headers(outsider))
+  retrieved = await client.get(
+    f"/projects/{project_id}",
+    headers=_auth_headers(outsider),
   )
-  assert proposed.status_code == 202
-  manager_acceptance = await client.post(
-    "/project-invitations/accept",
-    json={"token": _invitation_token(sent_emails)},
-    headers=_auth_headers(manager),
+  updated = await client.patch(
+    f"/projects/{project_id}",
+    json={"name": "Stolen"},
+    headers=_auth_headers(outsider),
   )
-  assert manager_acceptance.status_code == 200
-  project_id = manager_acceptance.json()["id"]
+  deleted = await client.delete(
+    f"/projects/{project_id}",
+    headers=_auth_headers(outsider),
+  )
 
-  worker_invitation = await client.post(
-    f"/organisations/{organisation.id}/projects/{project_id}/worker-invitations",
-    json={"user_id": str(worker.id)},
-    headers=_auth_headers(manager),
-  )
-  assert worker_invitation.status_code == 202
-  assert sent_emails[-1][0] == worker.email
+  assert listed.status_code == 200
+  assert listed.json() == []
+  assert retrieved.status_code == 404
+  assert updated.status_code == 404
+  assert deleted.status_code == 404
 
   async with session_factory() as session:
+    saved_project = await session.get(Project, uuid.UUID(project_id))
+  assert saved_project is not None
+  assert saved_project.name == "Private"
+
+
+@pytest.mark.asyncio
+async def test_member_can_read_but_not_update_or_delete_project(project_client):
+  client, session_factory = project_client
+  owner = await _create_user(session_factory)
+  member = await _create_user(session_factory)
+  created = await _create_project(client, owner, "Shared")
+  project_id = uuid.UUID(created.json()["id"])
+
+  async with session_factory() as session:
+    session.add(
+      ProjectMembership(
+        project_id=project_id,
+        user_id=member.id,
+        role="member",
+      ),
+    )
+    await session.commit()
+
+  listed = await client.get("/projects", headers=_auth_headers(member))
+  retrieved = await client.get(
+    f"/projects/{project_id}",
+    headers=_auth_headers(member),
+  )
+  updated = await client.patch(
+    f"/projects/{project_id}",
+    json={"name": "Changed"},
+    headers=_auth_headers(member),
+  )
+  deleted = await client.delete(
+    f"/projects/{project_id}",
+    headers=_auth_headers(member),
+  )
+
+  assert listed.status_code == 200
+  assert listed.json()[0]["role"] == "member"
+  assert retrieved.status_code == 200
+  assert retrieved.json()["role"] == "member"
+  assert updated.status_code == 403
+  assert deleted.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_owner_can_update_and_delete_project_resources(project_client):
+  client, session_factory = project_client
+  owner = await _create_user(session_factory)
+  created = await _create_project(client, owner, "Before")
+  project_id = uuid.UUID(created.json()["id"])
+  async with session_factory() as session:
+    session.add(
+      Environment(
+        project_id=project_id,
+        name="Production",
+        environment_type="production",
+      ),
+    )
+    await session.commit()
+
+  updated = await client.patch(
+    f"/projects/{project_id}",
+    json={"name": "After", "description": None},
+    headers=_auth_headers(owner),
+  )
+  retrieved = await client.get(
+    f"/projects/{project_id}",
+    headers=_auth_headers(owner),
+  )
+  deleted = await client.delete(
+    f"/projects/{project_id}",
+    headers=_auth_headers(owner),
+  )
+
+  assert updated.status_code == 200
+  assert updated.json()["name"] == "After"
+  assert updated.json()["description"] is None
+  assert retrieved.json()["name"] == "After"
+  assert deleted.status_code == 204
+  async with session_factory() as session:
+    assert await session.get(Project, project_id) is None
+    assert await session.scalar(
+      select(Environment.id).where(Environment.project_id == project_id),
+    ) is None
     assert await session.scalar(
       select(ProjectMembership.id).where(
-        ProjectMembership.project_id == uuid.UUID(project_id),
-        ProjectMembership.user_id == worker.id,
+        ProjectMembership.project_id == project_id,
       ),
     ) is None
 
-  worker_acceptance = await client.post(
-    "/project-invitations/accept",
-    json={"token": _invitation_token(sent_emails)},
-    headers=_auth_headers(worker),
-  )
-  assert worker_acceptance.status_code == 200
-  assert worker_acceptance.json()["role"] == "worker"
-
-  worker_projects = await client.get(
-    f"/organisations/{organisation.id}/projects",
-    headers=_auth_headers(worker),
-  )
-  assert [item["id"] for item in worker_projects.json()] == [project_id]
-  assert worker_projects.json()[0]["role"] == "worker"
-
 
 @pytest.mark.asyncio
-async def test_project_invites_require_existing_verified_org_members(
+async def test_project_membership_constraints_reject_duplicate_and_bad_role(
   project_client,
 ):
-  client, session_factory, _sent_emails = project_client
+  client, session_factory = project_client
   owner = await _create_user(session_factory)
-  non_member = await _create_user(session_factory)
-  organisation = await _create_organisation(session_factory, owner)
-
-  response = await _propose_project(
-    client,
-    organisation.id,
-    owner,
-    non_member,
-  )
-
-  assert response.status_code == 400
-
-
-@pytest.mark.asyncio
-async def test_worker_invitation_rejects_non_members_and_duplicate_members(
-  project_client,
-):
-  client, session_factory, sent_emails = project_client
-  owner = await _create_user(session_factory)
-  manager = await _create_user(session_factory)
-  worker = await _create_user(session_factory)
-  outsider = await _create_user(session_factory)
-  organisation = await _create_organisation(session_factory, owner)
-  await _add_organisation_member(session_factory, organisation.id, manager)
-  await _add_organisation_member(session_factory, organisation.id, worker)
-
-  proposal = await _propose_project(
-    client,
-    organisation.id,
-    owner,
-    manager,
-  )
-  manager_accepted = await client.post(
-    "/project-invitations/accept",
-    json={"token": _invitation_token(sent_emails)},
-    headers=_auth_headers(manager),
-  )
-  project_id = manager_accepted.json()["id"]
-
-  outsider_response = await client.post(
-    f"/organisations/{organisation.id}/projects/{project_id}/worker-invitations",
-    json={"user_id": str(outsider.id)},
-    headers=_auth_headers(manager),
-  )
-  assert outsider_response.status_code == 400
-
-  first_invitation = await client.post(
-    f"/organisations/{organisation.id}/projects/{project_id}/worker-invitations",
-    json={"user_id": str(worker.id)},
-    headers=_auth_headers(manager),
-  )
-  duplicate_invitation = await client.post(
-    f"/organisations/{organisation.id}/projects/{project_id}/worker-invitations",
-    json={"user_id": str(worker.id)},
-    headers=_auth_headers(manager),
-  )
-  assert first_invitation.status_code == 202
-  assert duplicate_invitation.status_code == 409
-
-
-@pytest.mark.asyncio
-async def test_project_invitation_is_bound_to_invited_identity_and_single_use(
-  project_client,
-):
-  client, session_factory, sent_emails = project_client
-  owner = await _create_user(session_factory)
-  manager = await _create_user(session_factory)
-  another_member = await _create_user(session_factory)
-  organisation = await _create_organisation(session_factory, owner)
-  await _add_organisation_member(session_factory, organisation.id, manager)
-  await _add_organisation_member(session_factory, organisation.id, another_member)
-
-  invitation = await _propose_project(
-    client,
-    organisation.id,
-    owner,
-    manager,
-  )
-  token = _invitation_token(sent_emails)
-  wrong_user_acceptance = await client.post(
-    "/project-invitations/accept",
-    json={"token": token},
-    headers=_auth_headers(another_member),
-  )
-  accepted = await client.post(
-    "/project-invitations/accept",
-    json={"token": token},
-    headers=_auth_headers(manager),
-  )
-  replayed = await client.post(
-    "/project-invitations/accept",
-    json={"token": token},
-    headers=_auth_headers(manager),
-  )
-
-  assert invitation.status_code == 202
-  assert wrong_user_acceptance.status_code == 403
-  assert accepted.status_code == 200
-  assert replayed.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_project_endpoints_require_authentication(project_client):
-  client, session_factory, _sent_emails = project_client
-  owner = await _create_user(session_factory)
-  organisation = await _create_organisation(session_factory, owner)
-
-  response = await client.get(
-    f"/organisations/{organisation.id}/projects",
-  )
-
-  assert response.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_project_membership_constraints_enforce_scope_and_uniqueness(
-  project_client,
-):
-  _client, session_factory, _sent_emails = project_client
-  owner = await _create_user(session_factory)
-  member = await _create_user(session_factory)
-  outsider = await _create_user(session_factory)
-  organisation = await _create_organisation(session_factory, owner)
-  other_organisation = await _create_organisation(
-    session_factory,
-    outsider,
-    "Other organization",
-  )
-  await _add_organisation_member(session_factory, organisation.id, member)
-
-  async with session_factory() as session:
-    project = Project(
-      organisation_id=organisation.id,
-      name="Constraint project",
-    )
-    session.add(project)
-    await session.commit()
-    project_id = project.id
+  created = await _create_project(client, owner, "Constrained")
+  project_id = uuid.UUID(created.json()["id"])
 
   async with session_factory() as session:
     session.add(
       ProjectMembership(
         project_id=project_id,
-        organisation_id=organisation.id,
-        user_id=member.id,
-        role="worker",
+        user_id=owner.id,
+        role="owner",
       ),
     )
-    await session.commit()
+    with pytest.raises(IntegrityError):
+      await session.flush()
+    await session.rollback()
 
   async with session_factory() as session:
     session.add(
       ProjectMembership(
         project_id=project_id,
-        organisation_id=organisation.id,
-        user_id=member.id,
+        user_id=uuid.uuid4(),
         role="manager",
       ),
     )
     with pytest.raises(IntegrityError):
-      await session.commit()
+      await session.flush()
     await session.rollback()
 
-  async with session_factory() as session:
-    session.add(
-      ProjectMembership(
-        project_id=project_id,
-        organisation_id=organisation.id,
-        user_id=outsider.id,
-        role="worker",
-      ),
-    )
-    with pytest.raises(IntegrityError):
-      await session.commit()
-    await session.rollback()
 
-  assert other_organisation.id != organisation.id
+@pytest.mark.asyncio
+async def test_project_endpoints_require_authentication(project_client):
+  client, _session_factory = project_client
+
+  created = await client.post("/projects", json={"name": "Unauthenticated"})
+  listed = await client.get("/projects")
+
+  assert created.status_code == 401
+  assert listed.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_auth_me_reports_project_memberships_without_organization_data(
+  project_client,
+):
+  client, session_factory = project_client
+  owner = await _create_user(session_factory)
+  created = await _create_project(client, owner, "Profile Project")
+
+  profile = await client.get("/auth/me", headers=_auth_headers(owner))
+
+  assert profile.status_code == 200
+  assert profile.json()["projects"] == [
+    {
+      "id": created.json()["id"],
+      "name": "Profile Project",
+      "role": "owner",
+    },
+  ]
+  assert "organisations" not in profile.json()

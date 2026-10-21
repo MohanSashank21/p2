@@ -94,13 +94,13 @@ class UserResponse(BaseModel):
   display_name: str
   email_verified: bool
 
-class OrganisationMembershipResponse(BaseModel):
+class CurrentUserProjectResponse(BaseModel):
   id: uuid.UUID
   name: str
   role: Literal["owner", "member"]
 
 class CurrentUserResponse(UserResponse):
-  organisations: list[OrganisationMembershipResponse]
+  projects: list[CurrentUserProjectResponse]
 
 class OrganisationInvitationRequest(BaseModel):
   email: EmailStr

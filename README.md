@@ -85,9 +85,7 @@ contain at least 32 bytes.
 
 Projects are the active ownership and access boundary. Public account
 registration creates a user only; it does not create a project or grant access.
-Organization and invitation tables from earlier versions remain in the
-database for data preservation, but organization routes and invitation
-workflows are no longer registered by the application.
+Organization and invitation routes, models, and storage have been removed.
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -104,23 +102,14 @@ are project-owned database resources and are deleted with their project. The
 environment model exists, but environment-management endpoints and invitation
 endpoints are not implemented.
 
-## Project access migration
+## Current scope
 
-The project-scoped access migration preserves organization and invitation
-tables and their existing records. It makes the legacy project organization
-reference nullable for newly created projects, removes project-membership
-dependencies on organization membership, maps existing `manager` memberships
-to `owner` and `worker` memberships to `member`, and grants project ownership
-to the legacy organization owner only when a project has no existing owner.
-The migration does not drop project, user, organization, membership, or
-invitation data. Review the migration and back up the database before applying
-it. It refuses downgrade after projects or memberships without organization
-assignments have been created, because the old schema cannot represent those
-records without inventing an organization assignment.
-
-The invitation email outbox and invitation records are retained as legacy
-data, but the application no longer starts the invitation email worker.
-Previously queued invitation messages remain stored and are not sent.
+The backend currently provides authentication, project-level ownership and
+membership, and environments. Incident and evidence workflows are not yet
+implemented. The migration removing the legacy organization and invitation
+schema refuses to run while records in those legacy tables remain; it preserves
+users, projects, project memberships, and environments. This migration is
+irreversible.
 
 ## Tests
 

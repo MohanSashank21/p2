@@ -16,17 +16,23 @@ class InvalidRefreshTokenError(Exception):
 class PermissionDeniedError(Exception):
   pass
 
-class InvitationTargetError(Exception):
-  pass
-
-class OrganisationConflictError(Exception):
-  pass
-
-class ProjectTargetError(Exception):
-  pass
-
 class ProjectNotFoundError(Exception):
   pass
 
 class ProjectConflictError(Exception):
+  pass
+
+class SourceConflictError(Exception):
+  pass
+
+class SourceCredentialError(Exception):
+  pass
+
+class SourceNotFoundError(Exception):
+  pass
+
+class IncidentNotFoundError(Exception):
+  pass
+
+class InvalidIncidentTransitionError(Exception):
   pass

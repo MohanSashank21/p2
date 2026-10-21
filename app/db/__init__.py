@@ -1,23 +1,19 @@
 from app.db import (
     auth,
-    email_outbox,
     environment,
-    membership,
-    organisation,
+    incident,
+    incident_source,
     project,
-    project_invitation,
     project_membership,
     user,
 )
 
 __all__ = [
     'auth',
-    'email_outbox',
     'environment',
-    'membership',
-    'organisation',
+    'incident',
+    'incident_source',
     'project',
-    'project_invitation',
     'project_membership',
     'user',
 ]

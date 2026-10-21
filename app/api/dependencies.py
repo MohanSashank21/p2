@@ -1,5 +1,4 @@
 import uuid
-from collections.abc import Callable
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -7,7 +6,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
-from app.db.membership import Membership
 from app.db.user import User
 from app.utils.jwt import verify_access_token
 
@@ -51,30 +49,3 @@ async def get_current_user(
       headers={"WWW-Authenticate": "Bearer"},
     )
   return user
-
-
-def require_organisation_role(*allowed_roles: str) -> Callable:
-  async def require_role(
-    organisation_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
-    session: AsyncSession = Depends(get_db),
-  ) -> Membership:
-    membership = await session.scalar(
-      select(Membership).where(
-        Membership.organisation_id == organisation_id,
-        Membership.user_id == current_user.id,
-      ),
-    )
-    if membership is None:
-      raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail="Organisation not found",
-      )
-    if membership.role not in allowed_roles:
-      raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Insufficient organisation permissions",
-      )
-    return membership
-
-  return require_role

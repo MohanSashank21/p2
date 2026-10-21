@@ -14,7 +14,7 @@ from redis.asyncio import Redis
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.db import auth, environment, membership, organisation, project, user
+from app.db import auth, environment, project, project_membership, user
 from app.db.base import Base
 from app.db.database import get_db
 from app.db.redis import get_redis

@@ -17,12 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.db import (
   auth,
-  email_outbox,
   environment,
-  membership,
-  organisation,
   project,
-  project_invitation,
   project_membership,
   user,
 )
@@ -145,9 +141,7 @@ async def test_project_creator_becomes_owner_and_projects_are_top_level(
         ProjectMembership.user_id == owner.id,
       ),
     )
-
   assert saved_project is not None
-  assert saved_project.legacy_organisation_id is None
   assert membership is not None
   assert membership.role == "owner"
 

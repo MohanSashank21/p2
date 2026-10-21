@@ -101,14 +101,3 @@ class CurrentUserProjectResponse(BaseModel):
 
 class CurrentUserResponse(UserResponse):
   projects: list[CurrentUserProjectResponse]
-
-class OrganisationInvitationRequest(BaseModel):
-  email: EmailStr
-  role: Literal["member"]
-
-class OrganisationInvitationResponse(BaseModel):
-  message: str
-  expires_in: int
-
-class OrganisationInvitationAcceptRequest(BaseModel):
-  token: str = Field(min_length=32, max_length=200)

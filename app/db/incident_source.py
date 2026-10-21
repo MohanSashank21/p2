@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+  Boolean,
+  DateTime,
+  ForeignKey,
+  JSON,
+  String,
+  Text,
+  UniqueConstraint,
+  Uuid,
+  func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.base import Base
+
+
+class IncidentSource(Base):
+  __tablename__ = "incident_sources"
+  __table_args__ = (
+    UniqueConstraint(
+      "project_id",
+      "name",
+      name="uq_incident_sources_project_name",
+    ),
+  )
+
+  id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    primary_key=True,
+    default=uuid.uuid4,
+  )
+  project_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("projects.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  environment_id: Mapped[uuid.UUID | None] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("environments.id", ondelete="SET NULL"),
+    nullable=True,
+    index=True,
+  )
+  name: Mapped[str] = mapped_column(String(120), nullable=False)
+  source_type: Mapped[str] = mapped_column(
+    String(40),
+    nullable=False,
+    default="generic_webhook",
+    server_default="generic_webhook",
+  )
+  credential_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+  enabled: Mapped[bool] = mapped_column(
+    Boolean,
+    nullable=False,
+    default=True,
+    server_default="true",
+  )
+  created_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True),
+    server_default=func.now(),
+    nullable=False,
+  )
+
+  events: Mapped[list["SourceEvent"]] = relationship(
+    back_populates="source",
+    cascade="all, delete-orphan",
+    passive_deletes=True,
+  )
+
+
+class SourceEvent(Base):
+  __tablename__ = "source_events"
+  __table_args__ = (
+    UniqueConstraint(
+      "source_id",
+      "external_event_id",
+      name="uq_source_events_source_external_id",
+    ),
+  )
+
+  id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    primary_key=True,
+    default=uuid.uuid4,
+  )
+  source_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("incident_sources.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  project_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("projects.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  environment_id: Mapped[uuid.UUID | None] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("environments.id", ondelete="SET NULL"),
+    nullable=True,
+    index=True,
+  )
+  external_event_id: Mapped[str | None] = mapped_column(
+    String(255),
+    nullable=True,
+  )
+  event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+  title: Mapped[str] = mapped_column(String(255), nullable=False)
+  description: Mapped[str | None] = mapped_column(Text, nullable=True)
+  severity: Mapped[str] = mapped_column(String(16), nullable=False)
+  original_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+  received_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True),
+    server_default=func.now(),
+    nullable=False,
+  )
+
+  source: Mapped[IncidentSource] = relationship(back_populates="events")

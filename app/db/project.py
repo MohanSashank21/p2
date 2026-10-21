@@ -6,10 +6,8 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import (
   DateTime,
-  ForeignKey,
   String,
   Text,
-  UniqueConstraint,
   Uuid,
   func,
 )
@@ -23,25 +21,11 @@ if TYPE_CHECKING:
 
 class Project(Base):
   __tablename__ = "projects"
-  __table_args__ = (
-    UniqueConstraint(
-      "id",
-      "organisation_id",
-      name="uq_projects_id_organisation",
-    ),
-  )
 
   id: Mapped[uuid.UUID] = mapped_column(
     Uuid(as_uuid=True),
     primary_key=True,
     default=uuid.uuid4,
-  )
-  legacy_organisation_id: Mapped[uuid.UUID | None] = mapped_column(
-    "organisation_id",
-    Uuid(as_uuid=True),
-    ForeignKey("organisations.id"),
-    nullable=True,
-    index=True,
   )
   name: Mapped[str] = mapped_column(
     String(120),

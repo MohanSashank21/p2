@@ -102,14 +102,45 @@ are project-owned database resources and are deleted with their project. The
 environment model exists, but environment-management endpoints and invitation
 endpoints are not implemented.
 
+## Event sources and incidents
+
+An owner can create a project webhook source. Its bearer credential is shown
+only at creation or rotation; store it in the sending system as a secret.
+Events sent to that source are stored under its project and create one
+open incident each. Repeated delivery with the same event ID returns the
+existing event and incident. The generic webhook is an intake endpoint, not a
+monitor: a monitoring tool or application must send it events.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /projects/{project_id}/sources` | Create a generic webhook source; owner only. |
+| `GET /projects/{project_id}/sources` | List source metadata; project members only. |
+| `POST /projects/{project_id}/sources/{source_id}/rotate-credential` | Rotate the source secret; owner only. |
+| `POST /projects/{project_id}/sources/{source_id}/disable` | Disable webhook intake; owner only. |
+| `POST /webhooks/sources/{source_id}` | Receive an event using the source's bearer credential; creates an incident. |
+| `POST /projects/{project_id}/incidents` | Report an incident manually; any authenticated project member. |
+| `GET /projects/{project_id}/incidents` | List incidents in a project. |
+| `GET /projects/{project_id}/incidents/{incident_id}` | Retrieve an incident within that project. |
+| `PATCH /projects/{project_id}/incidents/{incident_id}/status` | Change incident status through allowed transitions. |
+| `GET /projects/{project_id}/incidents/{incident_id}/evidence` | Retrieve the saved original and normalized report/event data. |
+| `GET /projects/{project_id}/events` | List received webhook events. |
+| `GET /projects/{project_id}/events/{event_id}` | Retrieve one event and its original payload. |
+
+Incident statuses start at `open`; supported transitions are
+`open` to `acknowledged` or `resolved`, `acknowledged` to `open` or `resolved`,
+and `resolved` to `open`. Source events and incident evidence are stored
+separately. Access to project incidents and events requires project membership;
+the webhook itself requires its source credential. There is not yet a
+provider-specific integration, AI investigation, or remediation workflow.
+
 ## Current scope
 
 The backend currently provides authentication, project-level ownership and
-membership, and environments. Incident and evidence workflows are not yet
-implemented. The migration removing the legacy organization and invitation
-schema refuses to run while records in those legacy tables remain; it preserves
-users, projects, project memberships, and environments. This migration is
-irreversible.
+membership, webhook event intake, manual and webhook-created incidents, and
+persisted evidence. It does not yet connect to a monitoring provider. The
+migration removing the legacy organization and invitation schema refuses to
+run while records in those legacy tables remain; it preserves users, projects,
+project memberships, and environments. This migration is irreversible.
 
 ## Tests
 

@@ -142,7 +142,7 @@ async def start_login(
   stored_hash = DUMMY_PASSWORD_HASH if user is None else user.password_hash
   password_matches = verify_password(request.password, stored_hash)
   if user is None or not user.email_verified or not password_matches:
-    return
+    raise InvalidCredentialsError("Invalid email or password")
 
   await _limit(
     redis,

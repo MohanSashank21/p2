@@ -218,6 +218,11 @@ async def login(
     )
   except RateLimitExceededError as error:
     raise _raise_rate_limit(error) from error
+  except InvalidCredentialsError as error:
+    raise HTTPException(
+      status_code=status.HTTP_401_UNAUTHORIZED,
+      detail=str(error),
+    ) from error
   except EmailDeliveryError as error:
     raise _raise_email_delivery(error) from error
   except RuntimeError as error:

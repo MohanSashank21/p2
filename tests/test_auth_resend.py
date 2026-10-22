@@ -264,6 +264,48 @@ async def test_password_reset_resend_replaces_active_code(api_client):
 
 
 @pytest.mark.asyncio
+async def test_login_rejects_invalid_credentials_without_sending_otp(api_client):
+  client, session_factory, sent_emails = api_client
+  verified_email = _email("invalid-login")
+  unverified_email = _email("unverified-login")
+  async with session_factory() as session:
+    session.add_all(
+      [
+        User(
+          email=verified_email,
+          display_name="Verified User",
+          password_hash=hash_password("CorrectPass123!"),
+          email_verified=True,
+        ),
+        User(
+          email=unverified_email,
+          display_name="Unverified User",
+          password_hash=hash_password("CorrectPass123!"),
+          email_verified=False,
+        ),
+      ],
+    )
+    await session.commit()
+
+  attempts = [
+    {"email": verified_email, "password": "WrongPass123!"},
+    {"email": unverified_email, "password": "CorrectPass123!"},
+    {"email": _email("unknown-login"), "password": "WrongPass123!"},
+  ]
+  responses = [
+    await client.post("/auth/login", json=attempt)
+    for attempt in attempts
+  ]
+
+  assert [response.status_code for response in responses] == [401, 401, 401]
+  assert {
+    response.json()["detail"]
+    for response in responses
+  } == {"Invalid email or password"}
+  assert sent_emails == []
+
+
+@pytest.mark.asyncio
 async def test_password_reset_completes_and_allows_login_with_new_password(
   api_client,
 ):

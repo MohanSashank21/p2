@@ -2,6 +2,7 @@ import json
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +43,11 @@ from app.services.source_service import (
 
 router = APIRouter(tags=["event sources"])
 MAX_SOURCE_EVENT_BYTES = 1_048_576
+source_bearer = HTTPBearer(
+  scheme_name="SourceCredential",
+  description="Bearer credential returned when the project source is created.",
+  auto_error=False,
+)
 
 
 def _source_response(source: IncidentSource) -> SourceResponse:
@@ -224,24 +230,45 @@ async def disable_project_source(
   response_model=SourceEventAcceptedResponse,
   status_code=status.HTTP_201_CREATED,
   responses={200: {"model": SourceEventAcceptedResponse}},
+  openapi_extra={
+    "requestBody": {
+      "required": True,
+      "content": {
+        "application/json": {
+          "schema": IncomingSourceEvent.model_json_schema(),
+          "example": {
+            "event_id": "alert-2026-01",
+            "event_type": "infrastructure",
+            "title": "High memory usage",
+            "description": "Memory usage exceeded the configured threshold.",
+            "severity": "high",
+            "labels": {"service": "payments", "environment": "production"},
+          },
+        },
+      },
+    },
+  },
 )
 async def receive_event(
   source_id: uuid.UUID,
   request: Request,
   response: Response,
+  credentials: HTTPAuthorizationCredentials | None = Depends(source_bearer),
   redis: Redis = Depends(get_redis),
   session: AsyncSession = Depends(get_db),
 ) -> SourceEventAcceptedResponse:
-  authorization = request.headers.get("authorization", "")
-  scheme, _, credential = authorization.partition(" ")
-  if scheme.lower() != "bearer" or not credential.strip():
+  if credentials is None or not credentials.credentials.strip():
     raise HTTPException(
       status_code=status.HTTP_401_UNAUTHORIZED,
       detail="Source credential required",
       headers={"WWW-Authenticate": "Bearer"},
     )
   try:
-    source = await authenticate_source(session, source_id, credential.strip())
+    source = await authenticate_source(
+      session,
+      source_id,
+      credentials.credentials.strip(),
+    )
   except SourceCredentialError as error:
     raise HTTPException(
       status_code=status.HTTP_401_UNAUTHORIZED,

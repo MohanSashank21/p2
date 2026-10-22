@@ -32,6 +32,27 @@ from app.main import app
 from app.utils.jwt import create_access_token
 
 
+def test_webhook_openapi_documents_body_and_source_bearer_credential():
+  operation = app.openapi()["paths"]["/webhooks/sources/{source_id}"]["post"]
+
+  request_body = operation["requestBody"]
+  assert request_body["required"] is True
+  schema = request_body["content"]["application/json"]["schema"]
+  assert schema["properties"]["title"]["type"] == "string"
+  assert schema["required"] == ["title"]
+  assert request_body["content"]["application/json"]["example"]["title"]
+
+  assert operation["security"] == [{"SourceCredential": []}]
+  security_scheme = app.openapi()["components"]["securitySchemes"]["SourceCredential"]
+  assert security_scheme == {
+    "type": "http",
+    "scheme": "bearer",
+    "description": (
+      "Bearer credential returned when the project source is created."
+    ),
+  }
+
+
 class FakeRedis:
   def __init__(self):
     self.counts: dict[str, int] = {}

@@ -10,6 +10,8 @@ from app.core.exceptions import (
   EmailDeliveryError,
   InvalidCredentialsError,
   InvalidOTPError,
+  OTPAttemptsExceededError,
+  OTPChallengeError,
   InvalidRefreshTokenError,
   RateLimitExceededError,
 )
@@ -111,6 +113,20 @@ def _raise_email_delivery(error: EmailDeliveryError) -> HTTPException:
     detail="Email could not be delivered. Please try again later.",
   )
 
+def _raise_otp_challenge(error: OTPChallengeError) -> HTTPException:
+  return HTTPException(
+    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+    detail="Verification code could not be activated. Please request a new code.",
+  )
+
+def _raise_otp_attempts_exceeded(
+  error: OTPAttemptsExceededError,
+) -> HTTPException:
+  return HTTPException(
+    status_code=status.HTTP_400_BAD_REQUEST,
+    detail="Too many incorrect verification codes. Request a new code.",
+  )
+
 
 def _raise_missing_auth_config(error: RuntimeError) -> HTTPException:
   return HTTPException(
@@ -162,6 +178,8 @@ async def register(
     raise _raise_rate_limit(error) from error
   except EmailDeliveryError as error:
     raise _raise_email_delivery(error) from error
+  except OTPChallengeError as error:
+    raise _raise_otp_challenge(error) from error
   except RuntimeError as error:
     raise _raise_missing_auth_config(error) from error
   return OTPChallengeResponse(message=OTP_RESPONSE_MESSAGE)
@@ -192,6 +210,8 @@ async def verify_registration(
       status_code=status.HTTP_400_BAD_REQUEST,
       detail=str(error),
     ) from error
+  except OTPAttemptsExceededError as error:
+    raise _raise_otp_attempts_exceeded(error) from error
   except RateLimitExceededError as error:
     raise _raise_rate_limit(error) from error
   except RuntimeError as error:
@@ -225,6 +245,8 @@ async def login(
     ) from error
   except EmailDeliveryError as error:
     raise _raise_email_delivery(error) from error
+  except OTPChallengeError as error:
+    raise _raise_otp_challenge(error) from error
   except RuntimeError as error:
     raise _raise_missing_auth_config(error) from error
   return OTPChallengeResponse(message=OTP_RESPONSE_MESSAGE)
@@ -252,6 +274,8 @@ async def verify_login(
       status_code=status.HTTP_400_BAD_REQUEST,
       detail=str(error),
     ) from error
+  except OTPAttemptsExceededError as error:
+    raise _raise_otp_attempts_exceeded(error) from error
   except RateLimitExceededError as error:
     raise _raise_rate_limit(error) from error
   except RuntimeError as error:
@@ -292,6 +316,8 @@ async def resend_otp(
     raise _raise_rate_limit(error) from error
   except EmailDeliveryError as error:
     raise _raise_email_delivery(error) from error
+  except OTPChallengeError as error:
+    raise _raise_otp_challenge(error) from error
   except RuntimeError as error:
     raise _raise_missing_auth_config(error) from error
   return OTPChallengeResponse(message=OTP_RESPONSE_MESSAGE)
@@ -319,6 +345,8 @@ async def request_password_reset(
     raise _raise_rate_limit(error) from error
   except EmailDeliveryError as error:
     raise _raise_email_delivery(error) from error
+  except OTPChallengeError as error:
+    raise _raise_otp_challenge(error) from error
   except RuntimeError as error:
     raise _raise_missing_auth_config(error) from error
   return OTPChallengeResponse(message=OTP_RESPONSE_MESSAGE)
@@ -346,6 +374,8 @@ async def verify_password_reset(
       status_code=status.HTTP_400_BAD_REQUEST,
       detail=str(error),
     ) from error
+  except OTPAttemptsExceededError as error:
+    raise _raise_otp_attempts_exceeded(error) from error
   except RateLimitExceededError as error:
     raise _raise_rate_limit(error) from error
   return PasswordResetVerifiedResponse(

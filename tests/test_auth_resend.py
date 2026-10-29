@@ -1,3 +1,4 @@
+import asyncio
 import os
 import secrets
 
@@ -20,8 +21,10 @@ from app.db.database import get_db
 from app.db.redis import get_redis
 from app.db.user import User
 from app.main import app
+from app.core.config import settings
 from app.core.exceptions import EmailDeliveryError
 from app.services import auth_service
+from app.services.redis_service import _key
 from app.utils.password import hash_password
 
 
@@ -474,3 +477,83 @@ async def test_email_delivery_failure_is_not_reported_as_success(
 
   assert response.status_code == 503
   assert sent_emails == []
+
+
+@pytest.mark.asyncio
+async def test_otp_lifetime_starts_after_email_delivery(api_client, monkeypatch):
+  client, _session_factory, sent_emails = api_client
+  email = _email("delayed-email")
+  redis = Redis.from_url(
+    os.environ["REDIS_URL"],
+    db=15,
+    encoding="utf-8",
+    decode_responses=True,
+  )
+  key = _key("otp:register", email.casefold())
+  original_expiry = settings.OTP_EXPIRE_MINUTES
+  monkeypatch.setattr(settings, "OTP_EXPIRE_MINUTES", 1)
+
+  async def delayed_send(recipient: str, code: str) -> None:
+    await asyncio.sleep(1.5)
+    sent_emails.append((recipient, code))
+
+  monkeypatch.setattr(auth_service, "send_otp_email", delayed_send)
+  try:
+    response = await client.post(
+      "/auth/register",
+      json={
+        "email": email,
+        "display_name": "Delayed Delivery",
+        "password": "DelayedPass123!",
+      },
+    )
+    assert response.status_code == 202
+    assert len(sent_emails) == 1
+    assert await redis.pttl(key) > 59_000
+
+    resent = await client.post(
+      "/auth/otp/resend",
+      json={"email": email, "purpose": "register"},
+    )
+    assert resent.status_code == 202
+    assert len(sent_emails) == 2
+    assert await redis.pttl(key) > 59_000
+
+    verified = await client.post(
+      "/auth/register/verify",
+      json={"email": email, "code": sent_emails[-1][1]},
+    )
+    assert verified.status_code == 200
+  finally:
+    await redis.delete(key)
+    await redis.aclose()
+    monkeypatch.setattr(settings, "OTP_EXPIRE_MINUTES", original_expiry)
+
+
+@pytest.mark.asyncio
+async def test_third_incorrect_otp_attempt_reports_attempt_limit(api_client):
+  client, _session_factory, sent_emails = api_client
+  email = _email("otp-attempt-limit")
+
+  started = await client.post(
+    "/auth/register",
+    json={
+      "email": email,
+      "display_name": "Attempt Limit",
+      "password": "AttemptPass123!",
+    },
+  )
+  assert started.status_code == 202
+
+  responses = [
+    await client.post(
+      "/auth/register/verify",
+      json={"email": email, "code": "000000" if sent_emails[-1][1] != "000000" else "000001"},
+    )
+    for _ in range(3)
+  ]
+
+  assert [response.status_code for response in responses] == [400, 400, 400]
+  assert responses[-1].json()["detail"] == (
+    "Too many incorrect verification codes. Request a new code."
+  )

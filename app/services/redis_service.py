@@ -8,7 +8,7 @@ from typing import Any
 from redis.asyncio import Redis
 
 from app.core.config import settings
-from app.core.exceptions import RateLimitExceededError
+from app.core.exceptions import OTPAttemptsExceededError, RateLimitExceededError
 
 _INCREMENT_WITH_TTL = """
 local count = redis.call('INCR', KEYS[1])
@@ -17,6 +17,8 @@ if count == 1 then
 end
 return count
 """
+
+_OTP_DELIVERY_GRACE_SECONDS = 60
 
 _CREATE_CHALLENGE = """
 if redis.call('EXISTS', KEYS[1]) == 1 then
@@ -33,6 +35,16 @@ redis.call('HSET', KEYS[1],
   'password_hash', ARGV[6])
 redis.call('EXPIRE', KEYS[1], ARGV[7])
 return 1
+"""
+
+_ACTIVATE_CHALLENGE_EXPIRY = """
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
+if redis.call('HGET', KEYS[1], 'challenge_id') ~= ARGV[1] then
+  return 0
+end
+return redis.call('EXPIRE', KEYS[1], ARGV[2])
 """
 
 _RESEND_CHALLENGE = """
@@ -72,6 +84,7 @@ if stored_hash ~= ARGV[3] then
   local attempts = redis.call('HINCRBY', KEYS[1], 'attempts', 1)
   if attempts >= tonumber(ARGV[4]) then
     redis.call('DEL', KEYS[1])
+    return {'locked'}
   end
   return {'invalid'}
 end
@@ -142,6 +155,16 @@ async def rate_limit_source_events(client: Redis, source_id: uuid.UUID) -> None:
   )
 
 
+async def rate_limit_loki_queries(client: Redis, source_id: uuid.UUID) -> None:
+  await bump_rate_limit(
+    client,
+    "loki-query",
+    str(source_id),
+    limit=20,
+    window_seconds=60,
+  )
+
+
 async def limit_email_and_ip(
   client: Redis,
   email: str,
@@ -164,13 +187,16 @@ async def create_challenge(
   user_id: str | None = None,
   display_name: str | None = None,
   password_hash: str | None = None,
-) -> str | None:
+) -> tuple[str, str] | None:
   normalized_email = _normalize_email(email)
   key = _key(f"otp:{purpose}", normalized_email)
   challenge_id = secrets.token_urlsafe(24)
   code = f"{secrets.randbelow(1_000_000):06d}"
   code_hash = _hash_otp(normalized_email, purpose, challenge_id, code)
-  ttl = settings.OTP_EXPIRE_MINUTES * 60
+  ttl = (
+    settings.OTP_EXPIRE_MINUTES * 60
+    + _OTP_DELIVERY_GRACE_SECONDS
+  )
   created = int(
     await client.eval(
       _CREATE_CHALLENGE,
@@ -185,7 +211,23 @@ async def create_challenge(
       ttl,
     )
   )
-  return code if created else None
+  return (code, challenge_id) if created else None
+
+
+async def activate_challenge_expiry(
+  client: Redis,
+  email: str,
+  purpose: str,
+  challenge_id: str,
+) -> bool:
+  result = await client.eval(
+    _ACTIVATE_CHALLENGE_EXPIRY,
+    1,
+    _key(f"otp:{purpose}", _normalize_email(email)),
+    challenge_id,
+    settings.OTP_EXPIRE_MINUTES * 60,
+  )
+  return bool(result)
 
 
 async def resend_challenge(
@@ -201,6 +243,10 @@ async def resend_challenge(
     return None
   code = f"{secrets.randbelow(1_000_000):06d}"
   code_hash = _hash_otp(normalized_email, purpose, challenge_id, code)
+  ttl = (
+    settings.OTP_EXPIRE_MINUTES * 60
+    + _OTP_DELIVERY_GRACE_SECONDS
+  )
   result = int(
     await client.eval(
       _RESEND_CHALLENGE,
@@ -210,7 +256,7 @@ async def resend_challenge(
       state.get("code_hash", ""),
       code_hash,
       settings.OTP_MAX_RESENDS,
-      settings.OTP_EXPIRE_MINUTES * 60,
+      ttl,
     )
   )
   if result == -1:
@@ -242,7 +288,12 @@ async def verify_challenge(
     code_hash,
     settings.OTP_MAX_ATTEMPTS,
   )
-  if not result or result[0] != b"valid" and result[0] != "valid":
+  result_status = result[0].decode() if result and isinstance(result[0], bytes) else (
+    result[0] if result else None
+  )
+  if result_status == "locked":
+    raise OTPAttemptsExceededError("OTP verification attempt limit reached")
+  if result_status != "valid":
     return None
   return {
     "challenge_id": result[1].decode() if isinstance(result[1], bytes) else result[1],

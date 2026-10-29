@@ -10,9 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import get_current_user
 from app.core.exceptions import (
   PermissionDeniedError,
+  LokiIntegrationError,
   ProjectNotFoundError,
   RateLimitExceededError,
   SourceConflictError,
+  SourceConfigurationError,
   SourceCredentialError,
   SourceNotFoundError,
 )
@@ -21,6 +23,11 @@ from app.db.incident_source import IncidentSource, SourceEvent
 from app.db.redis import get_redis
 from app.db.user import User
 from app.schemas.source_schema import (
+  AlertmanagerAlertResult,
+  AlertmanagerWebhookPayload,
+  AlertmanagerWebhookResponse,
+  GrafanaWebhookPayload,
+  GrafanaWebhookResponse,
   IncomingSourceEvent,
   SourceCreateRequest,
   SourceCredentialResponse,
@@ -28,8 +35,11 @@ from app.schemas.source_schema import (
   SourceEventDetailResponse,
   SourceEventResponse,
   SourceResponse,
+  LokiSourceConfigurationRequest,
 )
 from app.services.redis_service import rate_limit_source_events
+from app.services.alertmanager_service import receive_provider_alert_payload
+from app.services.loki_service import automatically_retrieve_loki_logs
 from app.services.source_service import (
   authenticate_source,
   create_source,
@@ -39,6 +49,7 @@ from app.services.source_service import (
   list_sources,
   receive_source_event,
   rotate_source_credential,
+  update_loki_source,
 )
 
 router = APIRouter(tags=["event sources"])
@@ -50,6 +61,31 @@ source_bearer = HTTPBearer(
 )
 
 
+def _inline_schema_definitions(schema: dict) -> dict:
+  definitions = schema.pop("$defs", {})
+
+  def expand(value):
+    if isinstance(value, list):
+      return [expand(item) for item in value]
+    if not isinstance(value, dict):
+      return value
+    reference = value.get("$ref")
+    if isinstance(reference, str) and reference.startswith("#/$defs/"):
+      definition = definitions.get(reference.rsplit("/", 1)[-1], {})
+      expanded = expand(definition)
+      expanded.update(
+        {
+          key: expand(item)
+          for key, item in value.items()
+          if key != "$ref"
+        },
+      )
+      return expanded
+    return {key: expand(item) for key, item in value.items()}
+
+  return expand(schema)
+
+
 def _source_response(source: IncidentSource) -> SourceResponse:
   return SourceResponse(
     id=source.id,
@@ -59,6 +95,10 @@ def _source_response(source: IncidentSource) -> SourceResponse:
     source_type=source.source_type,
     enabled=source.enabled,
     created_at=source.created_at,
+    loki_url=source.loki_url,
+    loki_tenant_id=source.loki_tenant_id,
+    loki_auth_type=source.loki_auth_type,
+    loki_auth_configured=source.loki_auth_ciphertext is not None,
   )
 
 
@@ -106,7 +146,37 @@ async def _limited_body(request: Request) -> bytes:
   return b"".join(chunks)
 
 
-async def _parse_event_body(request: Request) -> tuple[IncomingSourceEvent, dict]:
+async def _automatically_retrieve_alert_logs(
+  session: AsyncSession,
+  redis: Redis,
+  project_id: uuid.UUID,
+  payload: AlertmanagerWebhookPayload | GrafanaWebhookPayload,
+  results: list[AlertmanagerAlertResult],
+) -> None:
+  for result in results:
+    if result.status != "firing" or result.incident_id is None:
+      continue
+    alert = next(
+      (
+        item
+        for item in payload.alerts
+        if item.fingerprint == result.fingerprint
+      ),
+      None,
+    )
+    if alert is None:
+      continue
+    result.loki_retrieval = await automatically_retrieve_loki_logs(
+      session,
+      redis,
+      project_id,
+      result.incident_id,
+      alert.labels,
+      alert.starts_at,
+    )
+
+
+async def _parse_json_object(request: Request) -> dict:
   raw_body = await _limited_body(request)
   try:
     payload = json.loads(raw_body)
@@ -120,6 +190,11 @@ async def _parse_event_body(request: Request) -> tuple[IncomingSourceEvent, dict
       status_code=status.HTTP_400_BAD_REQUEST,
       detail="Request body must be a JSON object",
     )
+  return payload
+
+
+async def _parse_event_body(request: Request) -> tuple[IncomingSourceEvent, dict]:
+  payload = await _parse_json_object(request)
   try:
     event = IncomingSourceEvent.model_validate(payload)
   except ValidationError as error:
@@ -132,10 +207,93 @@ async def _parse_event_body(request: Request) -> tuple[IncomingSourceEvent, dict
       for item in error.errors()
     ]
     raise HTTPException(
-      status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+      status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
       detail=details,
     ) from error
   return event, payload
+
+
+async def _parse_alertmanager_body(
+  request: Request,
+) -> tuple[AlertmanagerWebhookPayload, dict]:
+  payload = await _parse_json_object(request)
+  try:
+    event = AlertmanagerWebhookPayload.model_validate(payload)
+  except ValidationError as error:
+    details = [
+      {
+        "loc": item["loc"],
+        "msg": item["msg"],
+        "type": item["type"],
+      }
+      for item in error.errors()
+    ]
+    raise HTTPException(
+      status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+      detail=details,
+    ) from error
+  return event, payload
+
+
+async def _parse_grafana_body(
+  request: Request,
+) -> tuple[GrafanaWebhookPayload, dict]:
+  payload = await _parse_json_object(request)
+  try:
+    event = GrafanaWebhookPayload.model_validate(payload)
+  except ValidationError as error:
+    details = [
+      {
+        "loc": item["loc"],
+        "msg": item["msg"],
+        "type": item["type"],
+      }
+      for item in error.errors()
+    ]
+    raise HTTPException(
+      status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+      detail=details,
+    ) from error
+  return event, payload
+
+
+async def _authenticate_webhook_source(
+  source_id: uuid.UUID,
+  credentials: HTTPAuthorizationCredentials | None,
+  session: AsyncSession,
+) -> IncidentSource:
+  if credentials is None or not credentials.credentials.strip():
+    raise HTTPException(
+      status_code=status.HTTP_401_UNAUTHORIZED,
+      detail="Source credential required",
+      headers={"WWW-Authenticate": "Bearer"},
+    )
+  try:
+    return await authenticate_source(
+      session,
+      source_id,
+      credentials.credentials.strip(),
+    )
+  except SourceCredentialError as error:
+    raise HTTPException(
+      status_code=status.HTTP_401_UNAUTHORIZED,
+      detail=str(error),
+      headers={"WWW-Authenticate": "Bearer"},
+    ) from error
+
+
+async def _rate_limit_webhook_source(
+  redis: Redis,
+  source_id: uuid.UUID,
+) -> None:
+  try:
+    await rate_limit_source_events(redis, source_id)
+  except RateLimitExceededError as error:
+    raise HTTPException(
+      status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+      detail=str(error),
+      headers={"Retry-After": "60"},
+    ) from error
 
 
 def _raise_project_access_error(error: Exception) -> HTTPException:
@@ -163,6 +321,11 @@ async def create_project_source(
     raise _raise_project_access_error(error) from error
   except SourceConflictError as error:
     raise HTTPException(status_code=409, detail=str(error)) from error
+  except LokiIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
   return _credential_response(source, credential)
 
 
@@ -225,6 +388,37 @@ async def disable_project_source(
   return _source_response(source)
 
 
+@router.patch(
+  "/projects/{project_id}/sources/{source_id}/loki",
+  response_model=SourceResponse,
+)
+async def configure_loki_source(
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  request: LokiSourceConfigurationRequest,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> SourceResponse:
+  try:
+    source = await update_loki_source(
+      session,
+      project_id,
+      source_id,
+      user,
+      request,
+    )
+  except (ProjectNotFoundError, PermissionDeniedError) as error:
+    raise _raise_project_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  except LokiIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
+  return _source_response(source)
+
+
 @router.post(
   "/webhooks/sources/{source_id}",
   response_model=SourceEventAcceptedResponse,
@@ -257,33 +451,13 @@ async def receive_event(
   redis: Redis = Depends(get_redis),
   session: AsyncSession = Depends(get_db),
 ) -> SourceEventAcceptedResponse:
-  if credentials is None or not credentials.credentials.strip():
+  source = await _authenticate_webhook_source(source_id, credentials, session)
+  if source.source_type != "generic_webhook":
     raise HTTPException(
-      status_code=status.HTTP_401_UNAUTHORIZED,
-      detail="Source credential required",
-      headers={"WWW-Authenticate": "Bearer"},
+      status_code=status.HTTP_409_CONFLICT,
+      detail="This source is not configured for generic webhook events",
     )
-  try:
-    source = await authenticate_source(
-      session,
-      source_id,
-      credentials.credentials.strip(),
-    )
-  except SourceCredentialError as error:
-    raise HTTPException(
-      status_code=status.HTTP_401_UNAUTHORIZED,
-      detail=str(error),
-      headers={"WWW-Authenticate": "Bearer"},
-    ) from error
-
-  try:
-    await rate_limit_source_events(redis, source.id)
-  except RateLimitExceededError as error:
-    raise HTTPException(
-      status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-      detail=str(error),
-      headers={"Retry-After": "60"},
-    ) from error
+  await _rate_limit_webhook_source(redis, source.id)
 
   event_request, original_payload = await _parse_event_body(request)
   event, incident, duplicate = await receive_source_event(
@@ -303,6 +477,205 @@ async def receive_event(
     event=_event_response(event),
     incident_id=incident.id,
     duplicate=False,
+  )
+
+
+@router.post(
+  "/webhooks/sources/{source_id}/alertmanager",
+  response_model=AlertmanagerWebhookResponse,
+  status_code=status.HTTP_200_OK,
+  openapi_extra={
+    "requestBody": {
+      "required": True,
+      "content": {
+        "application/json": {
+          "schema": _inline_schema_definitions(
+            AlertmanagerWebhookPayload.model_json_schema(),
+          ),
+          "example": {
+            "receiver": "opspilot",
+            "status": "firing",
+            "version": "4",
+            "groupKey": '{}:{alertname="HighCPU"}',
+            "groupLabels": {"alertname": "HighCPU"},
+            "commonLabels": {"severity": "critical"},
+            "commonAnnotations": {"summary": "CPU usage is high"},
+            "externalURL": "http://alertmanager.example",
+            "alerts": [
+              {
+                "status": "firing",
+                "labels": {
+                  "alertname": "HighCPU",
+                  "severity": "critical",
+                  "instance": "server-01",
+                },
+                "annotations": {
+                  "summary": "CPU usage exceeded 90%",
+                  "description": "Production CPU is above threshold.",
+                },
+                "startsAt": "2026-10-22T08:00:00Z",
+                "endsAt": "0001-01-01T00:00:00Z",
+                "generatorURL": "http://prometheus.example/graph",
+                "fingerprint": "a1b2c3d4",
+              },
+            ],
+          },
+        },
+      },
+    },
+  },
+)
+async def receive_alertmanager_event(
+  source_id: uuid.UUID,
+  request: Request,
+  credentials: HTTPAuthorizationCredentials | None = Depends(source_bearer),
+  redis: Redis = Depends(get_redis),
+  session: AsyncSession = Depends(get_db),
+) -> AlertmanagerWebhookResponse:
+  source = await _authenticate_webhook_source(source_id, credentials, session)
+  if source.source_type != "alertmanager":
+    raise HTTPException(
+      status_code=status.HTTP_409_CONFLICT,
+      detail="This source is not configured for Alertmanager",
+    )
+  await _rate_limit_webhook_source(redis, source.id)
+  payload, original_payload = await _parse_alertmanager_body(request)
+  try:
+    results = await receive_provider_alert_payload(
+      session,
+      source,
+      payload,
+      original_payload,
+      provider="alertmanager",
+    )
+  except SourceConfigurationError as error:
+    raise HTTPException(
+      status_code=status.HTTP_409_CONFLICT,
+      detail="Alertmanager source changed while processing notification",
+    ) from error
+  await _automatically_retrieve_alert_logs(
+    session,
+    redis,
+    source.project_id,
+    payload,
+    results,
+  )
+  return AlertmanagerWebhookResponse(
+    received=len(results),
+    created=sum(result.outcome == "created" for result in results),
+    updated=sum(result.outcome == "updated" for result in results),
+    resolved=sum(result.outcome == "resolved" for result in results),
+    ignored=sum(result.outcome == "ignored" for result in results),
+    alerts=results,
+  )
+
+
+@router.post(
+  "/webhooks/sources/{source_id}/grafana",
+  response_model=GrafanaWebhookResponse,
+  status_code=status.HTTP_200_OK,
+  openapi_extra={
+    "requestBody": {
+      "required": True,
+      "content": {
+        "application/json": {
+          "schema": _inline_schema_definitions(
+            GrafanaWebhookPayload.model_json_schema(),
+          ),
+          "example": {
+            "receiver": "OpsPilot",
+            "status": "firing",
+            "orgId": 1,
+            "version": "1",
+            "groupKey": "{}:{alertname=\"HighCPU\"}",
+            "groupLabels": {"alertname": "HighCPU"},
+            "commonLabels": {"severity": "critical"},
+            "commonAnnotations": {"summary": "CPU usage is high"},
+            "externalURL": "https://grafana.example/",
+            "alerts": [
+              {
+                "status": "firing",
+                "labels": {
+                  "alertname": "HighCPU",
+                  "severity": "critical",
+                  "instance": "server-01",
+                },
+                "annotations": {
+                  "summary": "CPU usage exceeded 90%",
+                  "description": "Production CPU is above threshold.",
+                },
+                "startsAt": "2026-10-22T08:00:00Z",
+                "endsAt": "0001-01-01T00:00:00Z",
+                "generatorURL": "https://grafana.example/alerting/rule",
+                "fingerprint": "a1b2c3d4",
+                "dashboardURL": "https://grafana.example/d/abc",
+                "panelURL": "https://grafana.example/d/abc?viewPanel=1",
+                "silenceURL": "https://grafana.example/alerting/silence/new",
+                "imageURL": "",
+                "values": {"A": 95.2},
+              },
+            ],
+          },
+        },
+      },
+    },
+  },
+)
+async def receive_grafana_event(
+  source_id: uuid.UUID,
+  request: Request,
+  credentials: HTTPAuthorizationCredentials | None = Depends(source_bearer),
+  redis: Redis = Depends(get_redis),
+  session: AsyncSession = Depends(get_db),
+) -> GrafanaWebhookResponse:
+  source = await _authenticate_webhook_source(source_id, credentials, session)
+  if source.source_type != "grafana":
+    raise HTTPException(
+      status_code=status.HTTP_409_CONFLICT,
+      detail="This source is not configured for Grafana",
+    )
+  await _rate_limit_webhook_source(redis, source.id)
+  payload, original_payload = await _parse_grafana_body(request)
+  normalized_payload = AlertmanagerWebhookPayload.model_validate(
+    {
+      **payload.model_dump(
+        by_alias=True,
+        mode="json",
+        exclude={"alerts"},
+      ),
+      "alerts": [
+        alert.model_dump(by_alias=True, mode="json")
+        for alert in payload.alerts
+      ],
+    },
+  )
+  try:
+    results = await receive_provider_alert_payload(
+      session,
+      source,
+      normalized_payload,
+      original_payload,
+      provider="grafana",
+    )
+  except SourceConfigurationError as error:
+    raise HTTPException(
+      status_code=status.HTTP_409_CONFLICT,
+      detail="Grafana source changed while processing notification",
+    ) from error
+  await _automatically_retrieve_alert_logs(
+    session,
+    redis,
+    source.project_id,
+    payload,
+    results,
+  )
+  return GrafanaWebhookResponse(
+    received=len(results),
+    created=sum(result.outcome == "created" for result in results),
+    updated=sum(result.outcome == "updated" for result in results),
+    resolved=sum(result.outcome == "resolved" for result in results),
+    ignored=sum(result.outcome == "ignored" for result in results),
+    alerts=results,
   )
 
 

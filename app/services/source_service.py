@@ -8,7 +8,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
+  LokiIntegrationError,
   PermissionDeniedError,
+  SourceConfigurationError,
   ProjectNotFoundError,
   SourceConflictError,
   SourceCredentialError,
@@ -18,9 +20,14 @@ from app.db.environment import Environment
 from app.db.incident import Incident
 from app.db.incident_source import IncidentSource, SourceEvent
 from app.db.user import User
-from app.schemas.source_schema import IncomingSourceEvent, SourceCreateRequest
-from app.services.project_service import get_accessible_project
+from app.schemas.source_schema import (
+  IncomingSourceEvent,
+  LokiSourceConfigurationRequest,
+  SourceCreateRequest,
+)
 from app.services.incident_service import create_webhook_incident
+from app.services.loki_service import encrypt_loki_auth, validate_loki_url
+from app.services.project_service import get_accessible_project
 
 
 def _credential_hash(credential: str) -> str:
@@ -47,12 +54,32 @@ async def create_source(
     if environment is None:
       raise ProjectNotFoundError("Environment not found in this project")
 
+  loki_url = None
+  loki_auth_ciphertext = None
+  if request.source_type == "loki":
+    if request.loki_url is None:
+      raise LokiIntegrationError(422, "loki_url is required for Loki sources")
+    validate_loki_url(str(request.loki_url))
+    loki_url = str(request.loki_url).rstrip("/")
+    loki_auth_ciphertext = encrypt_loki_auth(
+      request.loki_auth_type,
+      request.loki_username,
+      request.loki_password,
+      request.loki_bearer_token,
+    )
+
   credential = secrets.token_urlsafe(32)
   source = IncidentSource(
     project_id=project_id,
     environment_id=request.environment_id,
     name=request.name,
     source_type=request.source_type,
+    loki_url=loki_url,
+    loki_tenant_id=request.loki_tenant_id,
+    loki_auth_type=(
+      request.loki_auth_type if request.source_type == "loki" else None
+    ),
+    loki_auth_ciphertext=loki_auth_ciphertext,
     credential_hash=_credential_hash(credential),
     enabled=True,
   )
@@ -66,6 +93,55 @@ async def create_source(
     ) from error
   await session.refresh(source)
   return source, credential
+
+
+async def update_loki_source(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+  request: LokiSourceConfigurationRequest,
+) -> IncidentSource:
+  source = await _get_managed_source(session, project_id, source_id, user)
+  if source.source_type != "loki":
+    raise SourceNotFoundError("Loki source not found")
+  validate_loki_url(str(request.loki_url))
+  source.loki_url = str(request.loki_url).rstrip("/")
+  source.loki_tenant_id = request.loki_tenant_id
+  source.loki_auth_type = request.loki_auth_type
+  source.loki_auth_ciphertext = encrypt_loki_auth(
+    request.loki_auth_type,
+    request.loki_username,
+    request.loki_password,
+    request.loki_bearer_token,
+  )
+  source.enabled = request.enabled
+  await session.commit()
+  await session.refresh(source)
+  return source
+
+
+async def get_project_loki_source(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+) -> IncidentSource:
+  await get_accessible_project(session, project_id, user)
+  source = await session.scalar(
+    select(IncidentSource).where(
+      IncidentSource.id == source_id,
+      IncidentSource.project_id == project_id,
+      IncidentSource.source_type == "loki",
+    ),
+  )
+  if source is None:
+    raise SourceNotFoundError("Loki source not found in this project")
+  if not source.enabled:
+    raise SourceConfigurationError("Loki source is disabled")
+  if source.loki_url is None or source.loki_auth_type is None:
+    raise SourceConfigurationError("Loki source is not configured")
+  return source
 
 
 async def list_sources(

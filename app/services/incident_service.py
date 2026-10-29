@@ -11,6 +11,7 @@ from app.core.exceptions import (
 )
 from app.db.environment import Environment
 from app.db.incident import Incident, IncidentEvidence
+from app.db.incident_source import AlertmanagerAlert
 from app.db.user import User
 from app.schemas.incident_schema import (
   IncidentCreateRequest,
@@ -176,6 +177,19 @@ async def update_incident_status(
       raise InvalidIncidentTransitionError(
         f"Cannot transition incident from {incident.status} to {request.status}",
       )
+    if request.status == "resolved":
+      active_alerts = await session.scalar(
+        select(AlertmanagerAlert.id)
+        .where(
+          AlertmanagerAlert.incident_id == incident.id,
+          AlertmanagerAlert.status == "firing",
+        )
+        .limit(1),
+      )
+      if active_alerts is not None:
+        raise InvalidIncidentTransitionError(
+          "Cannot resolve an incident while linked monitoring alerts are firing",
+        )
     incident.status = request.status
     incident.resolved_at = (
       datetime.now(UTC) if request.status == "resolved" else None
@@ -198,3 +212,32 @@ async def list_incident_evidence(
     .order_by(IncidentEvidence.created_at, IncidentEvidence.id),
   )
   return list(result)
+
+
+async def get_incident_log_labels(
+  session: AsyncSession,
+  incident_id: uuid.UUID,
+) -> dict[str, str]:
+  result = await session.scalars(
+    select(IncidentEvidence)
+    .where(
+      IncidentEvidence.incident_id == incident_id,
+      IncidentEvidence.evidence_type != "loki_logs",
+    )
+    .order_by(IncidentEvidence.created_at.desc(), IncidentEvidence.id.desc()),
+  )
+  for evidence in result:
+    labels = evidence.normalized_content.get("labels")
+    if not isinstance(labels, dict):
+      labels = evidence.original_content.get("labels")
+    if not isinstance(labels, dict):
+      alert = evidence.original_content.get("alert")
+      if isinstance(alert, dict):
+        labels = alert.get("labels")
+    if isinstance(labels, dict):
+      return {
+        key: value
+        for key, value in labels.items()
+        if isinstance(key, str) and isinstance(value, str)
+      }
+  return {}

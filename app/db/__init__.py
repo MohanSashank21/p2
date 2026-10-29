@@ -1,6 +1,7 @@
 from app.db import (
     auth,
     environment,
+    github,
     incident,
     incident_source,
     project,
@@ -11,6 +12,7 @@ from app.db import (
 __all__ = [
     'auth',
     'environment',
+    'github',
     'incident',
     'incident_source',
     'project',

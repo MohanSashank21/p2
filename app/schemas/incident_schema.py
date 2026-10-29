@@ -38,7 +38,7 @@ class IncidentResponse(BaseModel):
   environment_id: uuid.UUID | None
   source_event_id: uuid.UUID | None
   reported_by_user_id: uuid.UUID | None
-  source_type: Literal["manual", "generic_webhook"]
+  source_type: Literal["manual", "generic_webhook", "alertmanager", "grafana"]
   incident_type: str
   title: str
   description: str | None
@@ -53,7 +53,21 @@ class IncidentEvidenceResponse(BaseModel):
   id: uuid.UUID
   incident_id: uuid.UUID
   source_event_id: uuid.UUID | None
-  evidence_type: Literal["manual_report", "webhook_payload"]
+  evidence_type: Literal[
+    "manual_report",
+    "webhook_payload",
+    "alertmanager_notification",
+    "grafana_notification",
+    "loki_logs",
+    "github_context",
+  ]
+  incident_source_id: uuid.UUID | None = None
   original_content: dict
   normalized_content: dict
   created_at: datetime
+
+
+class LokiQueryResponse(BaseModel):
+  status: Literal["success", "empty"]
+  entry_count: int
+  evidence: IncidentEvidenceResponse

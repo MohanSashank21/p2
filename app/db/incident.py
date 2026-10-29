@@ -23,7 +23,7 @@ class Incident(Base):
   __tablename__ = "incidents"
   __table_args__ = (
     CheckConstraint(
-      "source_type IN ('manual', 'generic_webhook')",
+      "source_type IN ('manual', 'generic_webhook', 'alertmanager', 'grafana')",
       name="ck_incidents_source_type",
     ),
     CheckConstraint(
@@ -104,12 +104,25 @@ class IncidentEvidence(Base):
   __tablename__ = "incident_evidence"
   __table_args__ = (
     CheckConstraint(
-      "evidence_type IN ('manual_report', 'webhook_payload')",
+      "evidence_type IN ('manual_report', 'webhook_payload', "
+      "'alertmanager_notification', 'grafana_notification', 'loki_logs', "
+      "'github_context')",
       name="ck_incident_evidence_type",
     ),
     UniqueConstraint(
       "source_event_id",
       name="uq_incident_evidence_source_event_id",
+    ),
+    UniqueConstraint(
+      "alertmanager_alert_id",
+      "payload_hash",
+      name="uq_incident_evidence_alertmanager_payload",
+    ),
+    UniqueConstraint(
+      "incident_source_id",
+      "incident_id",
+      "query_hash",
+      name="uq_incident_evidence_loki_query",
     ),
   )
 
@@ -129,6 +142,18 @@ class IncidentEvidence(Base):
     ForeignKey("source_events.id", ondelete="SET NULL"),
     nullable=True,
   )
+  alertmanager_alert_id: Mapped[uuid.UUID | None] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("alertmanager_alerts.id", ondelete="SET NULL"),
+    nullable=True,
+  )
+  incident_source_id: Mapped[uuid.UUID | None] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("incident_sources.id", ondelete="SET NULL"),
+    nullable=True,
+  )
+  payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+  query_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
   evidence_type: Mapped[str] = mapped_column(String(32), nullable=False)
   original_content: Mapped[dict] = mapped_column(JSON, nullable=False)
   normalized_content: Mapped[dict] = mapped_column(JSON, nullable=False)

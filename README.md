@@ -28,6 +28,19 @@ Generate each signing/pepper secret independently with:
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
+For Loki connections, set `LOKI_ALLOWED_HOSTS` to a comma-separated exact
+host allowlist (include `:port` when using a non-default port). Generate and
+keep `LOKI_CREDENTIAL_ENCRYPTION_KEY` stable and backed up; it encrypts Loki
+outbound credentials at rest:
+
+```sh
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Loki URLs must use HTTP or HTTPS and match this allowlist. Use HTTPS outside
+trusted local networks. Loki sources support no authentication, bearer tokens,
+or basic authentication. Authenticated Loki sources require the encryption key.
+
 Configure SMTP (`SMTP_HOST`, `SMTP_FROM`, and either STARTTLS or implicit TLS)
 before using registration, login, or password reset. The canonical username
 setting is `SMTP_USER`; `SMTP_USERNAME` remains an accepted environment
@@ -104,40 +117,159 @@ endpoints are not implemented.
 
 ## Event sources and incidents
 
-An owner can create a project webhook source. Its bearer credential is shown
-only at creation or rotation; store it in the sending system as a secret.
-Events sent to that source are stored under its project and create one
-open incident each. Repeated delivery with the same event ID returns the
-existing event and incident. The generic webhook is an intake endpoint, not a
-monitor: a monitoring tool or application must send it events.
+A project owner creates a source and configures the sending system with its
+webhook URL and bearer credential. The credential is shown only at creation or
+rotation; store it in the sending system as a secret. OpsPilot receives events
+but does not monitor infrastructure itself.
+
+Generic webhook sources store each event and create one open incident. Repeated
+deliveries with the same event ID return the existing event and incident.
+Alertmanager sources accept Alertmanager's native batch format. Each alert is
+identified by its fingerprint within its source: repeated firing notifications
+update the existing alert, and a resolved notification resolves the associated
+incident only when no other linked Alertmanager alert remains firing. Exact
+retries do not create duplicate incidents or duplicate evidence. Updated
+provider payloads are retained as incident evidence.
+
+Loki is a pull-based evidence source, not an alert webhook. Create a source
+with `source_type: "loki"` and its base URL, optional tenant ID, and supported
+authentication settings. For an incident created from Grafana or Alertmanager,
+call `POST /projects/{project_id}/incidents/{incident_id}/loki-logs` with the
+Loki source ID, a time range of at most six hours, and one or more selector
+labels whose values exactly match labels already recorded on that incident.
+OpsPilot builds a safe LogQL stream selector, queries Loki's
+`/loki/api/v1/query_range` API, and stores bounded results as incident evidence.
+Repeated retrievals for the same source, incident, selector, range, and limit
+update the corresponding evidence instead of adding a duplicate record.
+Selectors are unavailable for manual incidents or incidents without Grafana or
+Alertmanager labels.
+
+Example Loki source creation (with no Loki authentication):
+
+```json
+{
+  "name": "Production Loki",
+  "source_type": "loki",
+  "loki_url": "https://loki.example.com",
+  "loki_tenant_id": "tenant-1",
+  "loki_auth_type": "none"
+}
+```
+
+Authenticated source creation uses `loki_auth_type: "bearer"` with
+`loki_bearer_token`, or `loki_auth_type: "basic"` with `loki_username` and
+`loki_password`. Secrets are encrypted using
+`LOKI_CREDENTIAL_ENCRYPTION_KEY` and are never returned by source APIs. Loki
+hostnames are restricted by `LOKI_ALLOWED_HOSTS`; an explicit non-default port
+must also appear in that allowlist.
+
+Grafana sources accept Grafana Alerting's default webhook notification format
+at `/webhooks/sources/{source_id}/grafana`. Grafana alert fingerprints are
+deduplicated within their source and use the same alert lifecycle and incident
+pipeline as Alertmanager. Original webhook data, including Grafana dashboard,
+panel, silence, image, and value metadata, is retained in evidence. Configure
+the Grafana webhook contact point with the source credential as its HTTP
+Authorization bearer token and enable resolved notifications. See the
+[Grafana webhook notifier documentation](https://grafana.com/docs/grafana/latest/alerting/configure-notifications/manage-contact-points/integrations/webhook-notifier/).
+
+When a Grafana or Alertmanager firing notification creates or updates an
+incident, OpsPilot automatically checks each enabled Loki source in that
+project. It discovers which alert label name/value pairs exist in Loki, then
+queries matching logs from five minutes before the alert start through receipt
+time (capped at six hours) and stores them as incident evidence. The webhook
+response reports successful, empty, skipped, rate-limited, or failed retrieval
+status for each Loki source. Loki failures do not undo the already-persisted
+alert; a later firing notification retries if no Loki evidence was stored.
+Manual incidents do not trigger automatic Loki retrieval because they do not
+provide provider alert labels or a firing timestamp.
+
+To create an Alertmanager source, an owner uses
+`POST /projects/{project_id}/sources` with:
+
+```json
+{
+  "name": "Production Alertmanager",
+  "source_type": "alertmanager"
+}
+```
+
+Configure Alertmanager to POST to
+`/webhooks/sources/{source_id}/alertmanager`, with the returned source
+credential as a Bearer token. The endpoint accepts native Alertmanager
+notification batches. Each new firing fingerprint creates its own incident;
+this milestone does not correlate separate alerts that may share a root cause.
+When an alert resolves, its incident is resolved only after its other linked
+alerts are no longer firing. A later firing notification for that fingerprint
+reopens the same incident.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /projects/{project_id}/sources` | Create a generic webhook source; owner only. |
+| `POST /projects/{project_id}/sources` | Create a generic webhook, Alertmanager, Grafana, or configured Loki source; owner only. |
 | `GET /projects/{project_id}/sources` | List source metadata; project members only. |
 | `POST /projects/{project_id}/sources/{source_id}/rotate-credential` | Rotate the source secret; owner only. |
 | `POST /projects/{project_id}/sources/{source_id}/disable` | Disable webhook intake; owner only. |
-| `POST /webhooks/sources/{source_id}` | Receive an event using the source's bearer credential; creates an incident. |
+| `PATCH /projects/{project_id}/sources/{source_id}/loki` | Update Loki URL, tenant, authentication, or enabled state; owner only. Responses never include Loki credentials. |
+| `POST /webhooks/sources/{source_id}` | Receive a generic event using the source's bearer credential; creates an incident. |
+| `POST /webhooks/sources/{source_id}/alertmanager` | Receive an Alertmanager batch using the source's bearer credential; creates or updates alerts and incidents. |
+| `POST /webhooks/sources/{source_id}/grafana` | Receive a Grafana Alerting batch using the source's bearer credential; creates or updates alerts and incidents. |
 | `POST /projects/{project_id}/incidents` | Report an incident manually; any authenticated project member. |
 | `GET /projects/{project_id}/incidents` | List incidents in a project. |
 | `GET /projects/{project_id}/incidents/{incident_id}` | Retrieve an incident within that project. |
 | `PATCH /projects/{project_id}/incidents/{incident_id}/status` | Change incident status through allowed transitions. |
 | `GET /projects/{project_id}/incidents/{incident_id}/evidence` | Retrieve the saved original and normalized report/event data. |
+| `POST /projects/{project_id}/incidents/{incident_id}/loki-logs` | Query the selected Loki source for bounded, incident-label-matched logs and persist them as evidence; project members only. |
 | `GET /projects/{project_id}/events` | List received webhook events. |
 | `GET /projects/{project_id}/events/{event_id}` | Retrieve one event and its original payload. |
 
 Incident statuses start at `open`; supported transitions are
 `open` to `acknowledged` or `resolved`, `acknowledged` to `open` or `resolved`,
-and `resolved` to `open`. Source events and incident evidence are stored
+and `resolved` to `open`. An incident with a linked firing Alertmanager alert
+cannot be manually resolved. Source events and incident evidence are stored
 separately. Access to project incidents and events requires project membership;
-the webhook itself requires its source credential. There is not yet a
-provider-specific integration, AI investigation, or remediation workflow.
+webhooks require their source credential. There is not yet an AI investigation, cross-alert correlation, or remediation
+workflow.
+
+## GitHub App integration
+
+GitHub repositories are authorized through a GitHub App installation, then
+explicitly connected to an OpsPilot project. Set the GitHub App's single
+webhook URL to a publicly reachable HTTPS URL ending in `/webhooks/github`.
+Subscribe only to **Workflow run** in the GitHub App's **Permissions & events**
+settings. OpsPilot stores completed runs with a conclusion other than
+`success`, `neutral`, `skipped`, or `cancelled`; pushes, pull-request activity,
+successful runs, and in-progress runs are acknowledged but not stored. The
+App needs repository read access to **Actions** for run details and logs, and
+**Contents** for commit and code-change details. The workflow-run payload
+includes the run, commit, branch, and log API references needed to investigate
+failures.
+
+GitHub sends subscribed events to this central endpoint. OpsPilot verifies the
+signature and stores relevant deliveries for every project that has connected
+that repository. It does not create repository-level GitHub webhooks or send
+GitHub comments, statuses, or notifications. A local development server needs
+a running public HTTPS tunnel; temporary quick-tunnel URLs stop working when the
+tunnel exits and are not suitable for a permanent webhook URL.
+
+`GET /projects/{project_id}/github/repositories/{repository_id}/webhook-events`
+lists events already received and stored; an empty list means no matching
+delivery has been stored yet. This endpoint does not query GitHub's delivery
+history. Use
+`GET /projects/{project_id}/github/repositories/{repository_id}/webhook-events/{event_id}/investigation`
+to fetch a stored failed run's current GitHub run details, jobs, commit and
+changed-file patches and source contents (up to ten text files of at most 1 MiB
+each; binary, removed, and oversized files are identified as unavailable), the
+ten most recent commits up to the failing commit, and workflow logs. This
+investigation context is fetched on demand rather than stored or fetched for
+every webhook; log output and code-file retrieval are bounded. It does not
+create an incident automatically.
 
 ## Current scope
 
 The backend currently provides authentication, project-level ownership and
-membership, webhook event intake, manual and webhook-created incidents, and
-persisted evidence. It does not yet connect to a monitoring provider. The
+membership, generic webhook event intake, Alertmanager and Grafana alert
+lifecycle intake, Loki log evidence retrieval, manual and webhook-created
+incidents, and persisted evidence. It does not yet
+run an AI investigation or remediation workflow. The
 migration removing the legacy organization and invitation schema refuses to
 run while records in those legacy tables remain; it preserves users, projects,
 project memberships, and environments. This migration is irreversible.

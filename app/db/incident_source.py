@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import (
   Boolean,
+  CheckConstraint,
   DateTime,
   ForeignKey,
   JSON,
@@ -53,6 +54,10 @@ class IncidentSource(Base):
     default="generic_webhook",
     server_default="generic_webhook",
   )
+  loki_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+  loki_tenant_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+  loki_auth_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+  loki_auth_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
   credential_hash: Mapped[str] = mapped_column(String(64), nullable=False)
   enabled: Mapped[bool] = mapped_column(
     Boolean,
@@ -122,3 +127,75 @@ class SourceEvent(Base):
   )
 
   source: Mapped[IncidentSource] = relationship(back_populates="events")
+
+
+class ProviderAlert(Base):
+  __tablename__ = "alertmanager_alerts"
+  __table_args__ = (
+    UniqueConstraint(
+      "source_id",
+      "fingerprint",
+      name="uq_alertmanager_alerts_source_fingerprint",
+    ),
+    CheckConstraint(
+      "status IN ('firing', 'resolved')",
+      name="ck_alertmanager_alerts_status",
+    ),
+  )
+
+  id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    primary_key=True,
+    default=uuid.uuid4,
+  )
+  source_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("incident_sources.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  project_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("projects.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  incident_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("incidents.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
+  status: Mapped[str] = mapped_column(String(16), nullable=False)
+  alert_name: Mapped[str] = mapped_column(String(255), nullable=False)
+  severity: Mapped[str] = mapped_column(String(16), nullable=False)
+  summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+  description: Mapped[str | None] = mapped_column(Text, nullable=True)
+  labels: Mapped[dict] = mapped_column(JSON, nullable=False)
+  annotations: Mapped[dict] = mapped_column(JSON, nullable=False)
+  starts_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True),
+    nullable=False,
+  )
+  ends_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+  )
+  generator_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+  latest_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+  first_received_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True),
+    nullable=False,
+  )
+  last_received_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True),
+    nullable=False,
+  )
+  resolved_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+  )
+
+
+AlertmanagerAlert = ProviderAlert

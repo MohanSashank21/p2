@@ -11,6 +11,7 @@ from app.db.base import Base
 from app.db import (
   auth,
   environment,
+  github,
   incident,
   incident_source,
   project,

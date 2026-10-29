@@ -10,6 +10,7 @@ from app.core.exceptions import (
   EmailDeliveryError,
   InvalidCredentialsError,
   InvalidOTPError,
+  OTPChallengeError,
   InvalidRefreshTokenError,
 )
 from app.core.config import settings
@@ -26,6 +27,7 @@ from app.services.redis_service import (
   create_challenge,
   create_password_reset_grant,
   consume_password_reset_grant,
+  activate_challenge_expiry,
   delete_challenge,
   limit_email_and_ip,
   resend_challenge as resend_redis_challenge,
@@ -86,7 +88,7 @@ async def _send_new_challenge(
   password_hash: str | None = None,
 ) -> None:
   normalized_email = _normalize_email(email)
-  code = await create_challenge(
+  challenge = await create_challenge(
     redis,
     normalized_email,
     purpose,
@@ -94,13 +96,23 @@ async def _send_new_challenge(
     display_name=display_name,
     password_hash=password_hash,
   )
-  if code is None:
+  if challenge is None:
     return
+  code, challenge_id = challenge
   try:
     await send_otp_email(normalized_email, code)
   except EmailDeliveryError:
     await delete_challenge(redis, normalized_email, purpose)
     raise
+  if not await activate_challenge_expiry(
+    redis,
+    normalized_email,
+    purpose,
+    challenge_id,
+  ):
+    raise OTPChallengeError(
+      "Verification code expired before email delivery completed",
+    )
 
 
 async def start_registration(
@@ -218,6 +230,15 @@ async def resend_challenge(
   except EmailDeliveryError:
     await delete_challenge(redis, email, purpose)
     raise
+  if not await activate_challenge_expiry(
+    redis,
+    email,
+    purpose,
+    state["challenge_id"],
+  ):
+    raise OTPChallengeError(
+      "Verification code expired before email delivery completed",
+    )
 
 
 async def _verify_challenge(

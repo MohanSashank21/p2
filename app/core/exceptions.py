@@ -10,6 +10,12 @@ class RateLimitExceededError(Exception):
 class InvalidOTPError(Exception):
   pass
 
+class OTPChallengeError(Exception):
+  pass
+
+class OTPAttemptsExceededError(Exception):
+  pass
+
 class InvalidRefreshTokenError(Exception):
   pass
 
@@ -28,6 +34,15 @@ class SourceConflictError(Exception):
 class SourceCredentialError(Exception):
   pass
 
+class SourceConfigurationError(Exception):
+  pass
+
+class LokiIntegrationError(Exception):
+  def __init__(self, status_code: int, detail: str):
+    self.status_code = status_code
+    self.detail = detail
+    super().__init__(detail)
+
 class SourceNotFoundError(Exception):
   pass
 
@@ -35,4 +50,16 @@ class IncidentNotFoundError(Exception):
   pass
 
 class InvalidIncidentTransitionError(Exception):
+  pass
+
+class GitHubIntegrationError(Exception):
+  def __init__(self, status_code: int, detail: str):
+    self.status_code = status_code
+    self.detail = detail
+    super().__init__(detail)
+
+class GitHubNotFoundError(Exception):
+  pass
+
+class GitHubConflictError(Exception):
   pass

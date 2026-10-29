@@ -3,7 +3,6 @@ from typing import Literal
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Settings(BaseSettings):
   APP_NAME: str = "OpsPilot AI"
   APP_VERSION: str = "1.0.0"
@@ -13,6 +12,15 @@ class Settings(BaseSettings):
   JWT_ACCESS_SECRET_KEY: SecretStr | None = None
   JWT_REFRESH_SECRET_KEY: SecretStr | None = None
   OTP_HASH_SECRET_KEY: SecretStr | None = None
+  LOKI_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
+  LOKI_ALLOWED_HOSTS: str = ""
+  LOKI_QUERY_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
+  GITHUB_APP_ID: str | None = None
+  GITHUB_APP_SLUG: str | None = None
+  GITHUB_APP_PRIVATE_KEY: SecretStr | None = None
+  GITHUB_WEBHOOK_SECRET: SecretStr | None = None
+  GITHUB_API_URL: str = "https://api.github.com"
+  GITHUB_API_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=60)
   ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, ge=1, le=60)
   REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, ge=1, le=90)
   OTP_EXPIRE_MINUTES: int = Field(default=5, ge=1, le=30)
@@ -43,6 +51,5 @@ class Settings(BaseSettings):
   @property
   def cors_origins(self) -> list[str]:
     return [origin.strip() for origin in self.FRONTEND_ORIGINS.split(",") if origin.strip()]
-
 
 settings = Settings()

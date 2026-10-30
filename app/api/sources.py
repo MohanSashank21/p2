@@ -17,6 +17,7 @@ from app.core.exceptions import (
   SourceConfigurationError,
   SourceCredentialError,
   SourceNotFoundError,
+  TraceIntegrationError,
 )
 from app.db.database import get_db
 from app.db.incident_source import IncidentSource, SourceEvent
@@ -36,6 +37,7 @@ from app.schemas.source_schema import (
   SourceEventResponse,
   SourceResponse,
   LokiSourceConfigurationRequest,
+  TraceSourceConfigurationRequest,
 )
 from app.services.redis_service import rate_limit_source_events
 from app.services.alertmanager_service import receive_provider_alert_payload
@@ -49,7 +51,9 @@ from app.services.source_service import (
   list_sources,
   receive_source_event,
   rotate_source_credential,
+  update_trace_source,
   update_loki_source,
+  validate_trace_source_connection,
 )
 
 router = APIRouter(tags=["event sources"])
@@ -99,6 +103,15 @@ def _source_response(source: IncidentSource) -> SourceResponse:
     loki_tenant_id=source.loki_tenant_id,
     loki_auth_type=source.loki_auth_type,
     loki_auth_configured=source.loki_auth_ciphertext is not None,
+    trace_backend=source.trace_backend,
+    trace_url=source.trace_url,
+    trace_tenant_id=source.trace_tenant_id,
+    trace_auth_type=source.trace_auth_type,
+    trace_auth_configured=source.trace_auth_ciphertext is not None,
+    trace_service_name=source.trace_service_name,
+    trace_resource_attributes=source.trace_resource_attributes or {},
+    trace_connection_status=source.trace_connection_status,
+    trace_last_checked_at=source.trace_last_checked_at,
   )
 
 
@@ -326,6 +339,11 @@ async def create_project_source(
       status_code=error.status_code,
       detail=error.detail,
     ) from error
+  except TraceIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
   return _credential_response(source, credential)
 
 
@@ -412,6 +430,71 @@ async def configure_loki_source(
   except SourceNotFoundError as error:
     raise HTTPException(status_code=404, detail=str(error)) from error
   except LokiIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
+  return _source_response(source)
+
+
+@router.patch(
+  "/projects/{project_id}/sources/{source_id}/traces",
+  response_model=SourceResponse,
+)
+async def configure_trace_source(
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  request: TraceSourceConfigurationRequest,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> SourceResponse:
+  try:
+    source = await update_trace_source(
+      session,
+      project_id,
+      source_id,
+      user,
+      request,
+    )
+  except (ProjectNotFoundError, PermissionDeniedError) as error:
+    raise _raise_project_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  except (SourceConfigurationError, TraceIntegrationError) as error:
+    status_code = (
+      error.status_code
+      if isinstance(error, TraceIntegrationError)
+      else status.HTTP_409_CONFLICT
+    )
+    detail = error.detail if isinstance(error, TraceIntegrationError) else str(error)
+    raise HTTPException(status_code=status_code, detail=detail) from error
+  return _source_response(source)
+
+
+@router.post(
+  "/projects/{project_id}/sources/{source_id}/traces/validate",
+  response_model=SourceResponse,
+)
+async def validate_trace_source(
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> SourceResponse:
+  try:
+    source = await validate_trace_source_connection(
+      session,
+      project_id,
+      source_id,
+      user,
+    )
+  except (ProjectNotFoundError, PermissionDeniedError) as error:
+    raise _raise_project_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  except SourceConfigurationError as error:
+    raise HTTPException(status_code=409, detail=str(error)) from error
+  except TraceIntegrationError as error:
     raise HTTPException(
       status_code=error.status_code,
       detail=error.detail,
@@ -621,6 +704,7 @@ async def receive_alertmanager_event(
     },
   },
 )
+
 async def receive_grafana_event(
   source_id: uuid.UUID,
   request: Request,

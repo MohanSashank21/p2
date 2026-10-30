@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from redis.asyncio import Redis
 from sqlalchemy import select
@@ -15,6 +17,7 @@ from app.core.exceptions import (
   InvalidRefreshTokenError,
   RateLimitExceededError,
 )
+
 from app.db.auth import RefreshSession
 from app.db.database import get_db
 from app.db.redis import get_redis
@@ -50,6 +53,7 @@ from app.services.auth_service import (
 )
 from app.utils.jwt import create_access_token, validate_auth_token_configuration
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 REFRESH_COOKIE_NAME = "opspilot_refresh"
 REFRESH_COOKIE_PATH = "/auth"
 OTP_RESPONSE_MESSAGE = (
@@ -129,6 +133,12 @@ def _raise_otp_attempts_exceeded(
 
 
 def _raise_missing_auth_config(error: RuntimeError) -> HTTPException:
+  logger.error(
+    "Authentication request failed because required auth configuration "
+    "or a dependent service is unavailable: %s",
+    error,
+    exc_info=(type(error), error, error.__traceback__),
+  )
   return HTTPException(
     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
     detail="Authentication or email delivery is not configured.",

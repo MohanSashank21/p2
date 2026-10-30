@@ -29,7 +29,6 @@ from app.services.project_service import get_accessible_project
 
 _MAX_INVESTIGATION_CODE_FILES = 10
 
-
 async def _require_owner(
   session: AsyncSession,
   project_id: uuid.UUID,

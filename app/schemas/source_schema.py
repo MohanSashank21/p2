@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+import math
 import re
 from typing import Literal, Self
 from pydantic import (
@@ -12,19 +13,32 @@ from pydantic import (
   model_validator,
 )
 
-
 class SourceCreateRequest(BaseModel):
   name: str = Field(min_length=1, max_length=120)
   environment_id: uuid.UUID | None = None
-  source_type: Literal["generic_webhook", "alertmanager", "grafana", "loki"] = (
-    "generic_webhook"
-  )
+  source_type: Literal[
+    "generic_webhook",
+    "alertmanager",
+    "grafana",
+    "loki",
+    "traces",
+    "docker",
+  ] = "generic_webhook"
   loki_url: AnyHttpUrl | None = None
   loki_tenant_id: str | None = Field(default=None, max_length=255)
   loki_auth_type: Literal["none", "bearer", "basic"] = "none"
   loki_username: str | None = Field(default=None, max_length=255)
   loki_password: SecretStr | None = None
   loki_bearer_token: SecretStr | None = None
+  trace_backend: Literal["tempo"] | None = None
+  trace_url: AnyHttpUrl | None = None
+  trace_tenant_id: str | None = Field(default=None, max_length=255)
+  trace_auth_type: Literal["none", "bearer", "basic"] = "none"
+  trace_username: str | None = Field(default=None, max_length=255)
+  trace_password: SecretStr | None = None
+  trace_bearer_token: SecretStr | None = None
+  trace_service_name: str | None = Field(default=None, max_length=255)
+  trace_resource_attributes: dict[str, str] = Field(default_factory=dict)
 
   @field_validator("name")
   @classmethod
@@ -35,7 +49,35 @@ class SourceCreateRequest(BaseModel):
     return name
 
   @model_validator(mode="after")
-  def validate_loki_configuration(self) -> Self:
+  def validate_source_configuration(self) -> Self:
+    has_trace_config = any(
+      (
+        self.trace_backend is not None,
+        self.trace_url is not None,
+        self.trace_tenant_id is not None,
+        self.trace_auth_type != "none",
+        self.trace_username is not None,
+        self.trace_password is not None,
+        self.trace_bearer_token is not None,
+        self.trace_service_name is not None,
+        bool(self.trace_resource_attributes),
+      ),
+    )
+    if self.source_type != "traces" and has_trace_config:
+      raise ValueError("Trace settings are only valid for trace sources")
+    if self.source_type == "traces":
+      _validate_trace_configuration(
+        self.trace_backend,
+        self.trace_url,
+        self.trace_tenant_id,
+        self.trace_auth_type,
+        self.trace_username,
+        self.trace_password,
+        self.trace_bearer_token,
+        self.trace_service_name,
+        self.trace_resource_attributes,
+      )
+
     if self.source_type != "loki":
       if any(
         (
@@ -127,6 +169,170 @@ class LokiSourceConfigurationRequest(BaseModel):
     return self
 
 
+def _validate_trace_configuration(
+  backend: Literal["tempo"] | None,
+  endpoint: AnyHttpUrl | None,
+  tenant_id: str | None,
+  auth_type: Literal["none", "bearer", "basic"],
+  username: str | None,
+  password: SecretStr | None,
+  bearer_token: SecretStr | None,
+  service_name: str | None,
+  resource_attributes: dict[str, str],
+) -> None:
+  if backend != "tempo":
+    raise ValueError("trace_backend must be tempo")
+  if endpoint is None:
+    raise ValueError("trace_url is required for trace sources")
+  if (
+    endpoint.username is not None
+    or endpoint.password is not None
+    or endpoint.query is not None
+    or endpoint.fragment is not None
+  ):
+    raise ValueError("Trace URL must not contain credentials, query, or fragment")
+  if tenant_id is not None and any(
+    ord(character) < 32 or ord(character) == 127
+    for character in tenant_id
+  ):
+    raise ValueError("Trace tenant ID must not contain control characters")
+  if auth_type == "none" and any((username, password, bearer_token)):
+    raise ValueError("Credentials are not allowed when trace_auth_type is none")
+  if auth_type == "bearer" and (
+    bearer_token is None
+    or not bearer_token.get_secret_value().strip()
+    or bearer_token.get_secret_value() != bearer_token.get_secret_value().strip()
+    or "\r" in bearer_token.get_secret_value()
+    or "\n" in bearer_token.get_secret_value()
+    or username is not None
+    or password is not None
+  ):
+    raise ValueError("Bearer trace authentication requires only trace_bearer_token")
+  if auth_type == "basic" and (
+    username is None
+    or not username.strip()
+    or ":" in username
+    or "\r" in username
+    or "\n" in username
+    or password is None
+    or not password.get_secret_value()
+    or bearer_token is not None
+  ):
+    raise ValueError("Basic trace authentication requires trace_username and trace_password")
+  if service_name is not None and not service_name.strip():
+    raise ValueError("trace_service_name must not be blank")
+  if len(resource_attributes) > 10:
+    raise ValueError("At most ten trace resource attributes may be configured")
+  for key, value in resource_attributes.items():
+    if (
+      re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*",
+        key,
+      ) is None
+      or key.startswith(".")
+      or key.endswith(".")
+      or not value.strip()
+      or len(value) > 256
+    ):
+      raise ValueError("Trace resource attributes must have valid keys and values")
+
+
+class TraceSourceConfigurationRequest(BaseModel):
+  trace_backend: Literal["tempo"] = "tempo"
+  trace_url: AnyHttpUrl
+  trace_tenant_id: str | None = Field(default=None, max_length=255)
+  trace_auth_type: Literal["none", "bearer", "basic"] = "none"
+  trace_username: str | None = Field(default=None, max_length=255)
+  trace_password: SecretStr | None = None
+  trace_bearer_token: SecretStr | None = None
+  trace_service_name: str | None = Field(default=None, max_length=255)
+  trace_resource_attributes: dict[str, str] = Field(default_factory=dict)
+  enabled: bool = True
+
+  @model_validator(mode="after")
+  def validate_trace_source(self) -> Self:
+    _validate_trace_configuration(
+      self.trace_backend,
+      self.trace_url,
+      self.trace_tenant_id,
+      self.trace_auth_type,
+      self.trace_username,
+      self.trace_password,
+      self.trace_bearer_token,
+      self.trace_service_name,
+      self.trace_resource_attributes,
+    )
+    return self
+
+
+class TraceQueryRequest(BaseModel):
+  source_id: uuid.UUID
+  trace_id: str | None = Field(default=None, min_length=16, max_length=32)
+  service_name: str | None = Field(default=None, min_length=1, max_length=255)
+  span_status: Literal["error", "ok", "unset"] | None = None
+  resource_attributes: dict[str, str | int | float | bool] = Field(
+    default_factory=dict,
+    max_length=10,
+  )
+  span_attributes: dict[str, str | int | float | bool] = Field(
+    default_factory=dict,
+    max_length=10,
+  )
+  start: datetime
+  end: datetime
+  limit: int = Field(default=5, ge=1, le=10)
+
+  @field_validator("trace_id")
+  @classmethod
+  def validate_trace_id(cls, trace_id: str | None) -> str | None:
+    if trace_id is not None and re.fullmatch(r"(?:[0-9a-fA-F]{16}|[0-9a-fA-F]{32})", trace_id) is None:
+      raise ValueError("Trace ID must be 16 or 32 hexadecimal characters")
+    return trace_id
+
+  @field_validator("service_name")
+  @classmethod
+  def validate_trace_service_name(cls, service_name: str | None) -> str | None:
+    if service_name is not None and not service_name.strip():
+      raise ValueError("service_name must not be blank")
+    return service_name.strip() if service_name is not None else None
+
+  @field_validator("resource_attributes", "span_attributes")
+  @classmethod
+  def validate_trace_attributes(
+    cls,
+    attributes: dict[str, str | int | float | bool],
+  ) -> dict[str, str | int | float | bool]:
+    for key, value in attributes.items():
+      if (
+        re.fullmatch(
+          r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*",
+          key,
+        ) is None
+        or key.startswith(".")
+        or key.endswith(".")
+        or (
+          isinstance(value, str)
+          and (not value.strip() or len(value) > 256)
+        )
+        or (
+          not isinstance(value, (str, int, float, bool))
+          or isinstance(value, float) and not math.isfinite(value)
+        )
+      ):
+        raise ValueError("Trace attributes must have valid keys and values")
+    return attributes
+
+  @model_validator(mode="after")
+  def validate_trace_time_range(self) -> Self:
+    if self.start.tzinfo is None or self.end.tzinfo is None:
+      raise ValueError("Trace query times must include a timezone")
+    if self.end <= self.start:
+      raise ValueError("Trace query end must be after start")
+    if (self.end - self.start).total_seconds() > 6 * 60 * 60:
+      raise ValueError("Trace query range cannot exceed six hours")
+    return self
+
+
 class SourceResponse(BaseModel):
   id: uuid.UUID
   project_id: uuid.UUID
@@ -139,6 +345,17 @@ class SourceResponse(BaseModel):
   loki_tenant_id: str | None = None
   loki_auth_type: str | None = None
   loki_auth_configured: bool = False
+  trace_backend: str | None = None
+  trace_url: str | None = None
+  trace_tenant_id: str | None = None
+  trace_auth_type: str | None = None
+  trace_auth_configured: bool = False
+  trace_service_name: str | None = None
+  trace_resource_attributes: dict[str, str] = Field(default_factory=dict)
+  trace_connection_status: Literal["not_checked", "connected", "unavailable"] = (
+    "not_checked"
+  )
+  trace_last_checked_at: datetime | None = None
 
 class SourceCredentialResponse(SourceResponse):
   credential: str

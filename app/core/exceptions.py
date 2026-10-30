@@ -43,6 +43,21 @@ class LokiIntegrationError(Exception):
     self.detail = detail
     super().__init__(detail)
 
+class TraceIntegrationError(Exception):
+  def __init__(self, status_code: int, detail: str):
+    self.status_code = status_code
+    self.detail = detail
+    super().__init__(detail)
+
+class DockerIntegrationError(Exception):
+  def __init__(self, status_code: int, detail: str):
+    self.status_code = status_code
+    self.detail = detail
+    super().__init__(detail)
+
+class DockerContainerNotFoundError(Exception):
+  pass
+
 class SourceNotFoundError(Exception):
   pass
 

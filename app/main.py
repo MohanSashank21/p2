@@ -24,6 +24,7 @@ async def lifespan(app: FastAPI):
     socket_timeout=2,
     health_check_interval=30,
   )
+  
   app.state.redis = redis_client
   try:
     await redis_client.ping()
@@ -57,7 +58,6 @@ if settings.cors_origins:
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
   )
-
 
 @app.exception_handler(RedisError)
 async def redis_error_handler(_request: Request, _error: RedisError) -> JSONResponse:

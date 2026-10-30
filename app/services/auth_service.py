@@ -58,7 +58,7 @@ def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc)
   return value.astimezone(timezone.utc)
 
-def _normalize_email(email: str) -> str:
+def normalize_email(email: str) -> str:
   return email.strip().lower()
 
 async def _limit(
@@ -87,7 +87,7 @@ async def _send_new_challenge(
   display_name: str | None = None,
   password_hash: str | None = None,
 ) -> None:
-  normalized_email = _normalize_email(email)
+  normalized_email = normalize_email(email)
   challenge = await create_challenge(
     redis,
     normalized_email,
@@ -121,7 +121,7 @@ async def start_registration(
   request: RegisterRequest,
   client_ip: str,
 ) -> None:
-  email = _normalize_email(str(request.email))
+  email = normalize_email(str(request.email))
   await _limit(
     redis,
     email,
@@ -148,7 +148,7 @@ async def start_login(
   request: LoginRequest,
   client_ip: str,
 ) -> None:
-  email = _normalize_email(str(request.email))
+  email = normalize_email(str(request.email))
   await _limit(redis, email, client_ip, "login", LOGIN_EMAIL_LIMIT, LOGIN_IP_LIMIT)
   user = await session.scalar(select(User).where(User.email == email))
   stored_hash = DUMMY_PASSWORD_HASH if user is None else user.password_hash
@@ -178,7 +178,7 @@ async def start_password_reset(
   email: str,
   client_ip: str,
 ) -> None:
-  email = _normalize_email(email)
+  email = normalize_email(email)
   await _limit(
     redis,
     email,
@@ -202,7 +202,7 @@ async def resend_challenge(
   purpose: str,
   client_ip: str,
 ) -> None:
-  email = _normalize_email(email)
+  email = normalize_email(email)
   await _limit(
     redis,
     email,
@@ -248,7 +248,7 @@ async def _verify_challenge(
   purpose: str,
   client_ip: str,
 ) -> tuple[User, dict[str, str]]:
-  email = _normalize_email(str(request.email))
+  email = normalize_email(str(request.email))
   await _limit(
     redis,
     email,

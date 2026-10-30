@@ -58,10 +58,8 @@ def send_email_sync(recipient: str, subject: str, body: str) -> None:
   except (OSError, smtplib.SMTPException) as error:
     raise EmailDeliveryError("Could not deliver email") from error
 
-
 async def send_email(recipient: str, subject: str, body: str) -> None:
   await asyncio.to_thread(send_email_sync, recipient, subject, body)
-
 
 async def send_otp_email(recipient: str, code: str) -> None:
   await send_email(

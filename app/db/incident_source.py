@@ -28,6 +28,10 @@ class IncidentSource(Base):
       "name",
       name="uq_incident_sources_project_name",
     ),
+    CheckConstraint(
+      "trace_connection_status IN ('not_checked', 'connected', 'unavailable')",
+      name="ck_incident_sources_trace_connection_status",
+    ),
   )
 
   id: Mapped[uuid.UUID] = mapped_column(
@@ -58,6 +62,23 @@ class IncidentSource(Base):
   loki_tenant_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
   loki_auth_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
   loki_auth_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+  trace_backend: Mapped[str | None] = mapped_column(String(32), nullable=True)
+  trace_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+  trace_tenant_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+  trace_auth_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
+  trace_auth_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+  trace_service_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+  trace_resource_attributes: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+  trace_connection_status: Mapped[str] = mapped_column(
+    String(16),
+    nullable=False,
+    default="not_checked",
+    server_default="not_checked",
+  )
+  trace_last_checked_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+  )
   credential_hash: Mapped[str] = mapped_column(String(64), nullable=False)
   enabled: Mapped[bool] = mapped_column(
     Boolean,
@@ -70,7 +91,6 @@ class IncidentSource(Base):
     server_default=func.now(),
     nullable=False,
   )
-
   events: Mapped[list["SourceEvent"]] = relationship(
     back_populates="source",
     cascade="all, delete-orphan",

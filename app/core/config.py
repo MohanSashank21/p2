@@ -1,5 +1,4 @@
 from typing import Literal
-
 from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +14,12 @@ class Settings(BaseSettings):
   LOKI_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
   LOKI_ALLOWED_HOSTS: str = ""
   LOKI_QUERY_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
+  TRACE_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
+  TRACE_ALLOWED_HOSTS: str = ""
+  TRACE_QUERY_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
+  DOCKER_HOST: str | None = None
+  DOCKER_QUERY_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=30)
+  DOCKER_LOG_MAX_BYTES: int = Field(default=131072, ge=1024, le=524288)
   GITHUB_APP_ID: str | None = None
   GITHUB_APP_SLUG: str | None = None
   GITHUB_APP_PRIVATE_KEY: SecretStr | None = None

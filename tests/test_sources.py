@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import secrets
 import uuid
@@ -19,6 +20,7 @@ from pydantic import SecretStr
 from sqlalchemy import event, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.api import docker as docker_api
 from app.db import (
   auth,
   environment,
@@ -31,12 +33,17 @@ from app.db.database import get_db
 from app.db.environment import Environment
 from app.db.incident import Incident, IncidentEvidence
 from app.db.incident_source import AlertmanagerAlert, IncidentSource, SourceEvent
+from app.db.github import (
+  GitHubInstallation,
+  GitHubRepository,
+  GitHubWebhookEvent,
+)
 from app.db.project_membership import ProjectMembership
 from app.db.redis import get_redis
 from app.db.user import User
 from app.main import app
 from app.core.config import settings
-from app.services import loki_service
+from app.services import incident_investigation_service, loki_service, trace_service
 from app.utils.jwt import create_access_token
 
 
@@ -1149,6 +1156,371 @@ async def test_loki_empty_result_and_timeout_are_distinguished(
 
 
 @pytest.mark.asyncio
+async def test_tempo_source_configuration_is_encrypted_and_owner_only(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  monkeypatch.setattr(settings, "TRACE_ALLOWED_HOSTS", "tempo.test")
+  encryption_key = Fernet.generate_key().decode("ascii")
+  monkeypatch.setattr(
+    settings,
+    "TRACE_CREDENTIAL_ENCRYPTION_KEY",
+    SecretStr(encryption_key),
+  )
+  owner = await _create_user(session_factory, "tempo-source-owner")
+  member = await _create_user(session_factory, "tempo-source-member")
+  project_id = await _create_project(client, owner, "Tempo source project")
+  await _create_member(session_factory, project_id, member)
+
+  invalid_host = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Untrusted Tempo",
+      "source_type": "traces",
+      "trace_backend": "tempo",
+      "trace_url": "http://127.0.0.1:3200",
+    },
+    headers=_headers(owner),
+  )
+  created = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Production Tempo",
+      "source_type": "traces",
+      "trace_backend": "tempo",
+      "trace_url": "https://tempo.test",
+      "trace_service_name": "checkout-api",
+      "trace_auth_type": "bearer",
+      "trace_bearer_token": "do-not-return-this-token",
+      "trace_resource_attributes": {"deployment.environment.name": "production"},
+    },
+    headers=_headers(owner),
+  )
+  source_id = created.json()["id"]
+  real_async_client = httpx.AsyncClient
+  health_requests: list[httpx.Request] = []
+
+  def health_handler(request: httpx.Request) -> httpx.Response:
+    health_requests.append(request)
+    return httpx.Response(200, json={"version": "2.8.0"})
+
+  monkeypatch.setattr(
+    trace_service.httpx,
+    "AsyncClient",
+    lambda *args, **kwargs: real_async_client(
+      transport=httpx.MockTransport(health_handler),
+      *args,
+      **kwargs,
+    ),
+  )
+  validated = await client.post(
+    f"/projects/{project_id}/sources/{source_id}/traces/validate",
+    headers=_headers(owner),
+  )
+  assert validated.status_code == 200
+  assert validated.json()["trace_connection_status"] == "connected"
+  assert health_requests[0].headers["Authorization"] == (
+    "Bearer do-not-return-this-token"
+  )
+
+  monkeypatch.setattr(
+    trace_service.httpx,
+    "AsyncClient",
+    lambda *args, **kwargs: real_async_client(
+      transport=httpx.MockTransport(
+        lambda _request: httpx.Response(401, text="credential rejected"),
+      ),
+      *args,
+      **kwargs,
+    ),
+  )
+  failed_validation = await client.post(
+    f"/projects/{project_id}/sources/{source_id}/traces/validate",
+    headers=_headers(owner),
+  )
+  listed = await client.get(
+    f"/projects/{project_id}/sources",
+    headers=_headers(owner),
+  )
+  forbidden_update = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}/traces",
+    json={
+      "trace_url": "https://tempo.test",
+      "trace_auth_type": "none",
+    },
+    headers=_headers(member),
+  )
+
+  assert invalid_host.status_code == 422
+  assert created.status_code == 201
+  assert created.json()["trace_backend"] == "tempo"
+  assert created.json()["trace_auth_configured"] is True
+  assert created.json()["trace_connection_status"] == "not_checked"
+  assert "do-not-return-this-token" not in created.text
+  assert failed_validation.status_code == 502
+  assert "credential rejected" not in failed_validation.text
+  assert listed.json()[0]["trace_connection_status"] == "unavailable"
+  assert forbidden_update.status_code == 403
+  async with session_factory() as session:
+    source = await session.get(IncidentSource, uuid.UUID(source_id))
+  assert source is not None
+  assert source.trace_auth_ciphertext is not None
+  decrypted = json.loads(
+    Fernet(encryption_key.encode("ascii")).decrypt(
+      source.trace_auth_ciphertext.encode("ascii"),
+    ),
+  )
+  assert decrypted == {"token": "do-not-return-this-token"}
+
+
+@pytest.mark.asyncio
+async def test_tempo_query_normalizes_and_deduplicates_incident_evidence(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  monkeypatch.setattr(settings, "TRACE_ALLOWED_HOSTS", "tempo.test")
+  owner = await _create_user(session_factory, "tempo-query-owner")
+  project_id = await _create_project(client, owner, "Tempo query project")
+  source = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Tempo",
+      "source_type": "traces",
+      "trace_backend": "tempo",
+      "trace_url": "https://tempo.test",
+      "trace_service_name": "checkout-api",
+    },
+    headers=_headers(owner),
+  )
+  assert source.status_code == 201
+  source_id = source.json()["id"]
+  incident = await _create_labeled_test_incident(session_factory, project_id)
+  trace_id = "a" * 32
+  calls: list[httpx.Request] = []
+  return_empty = False
+
+  def handler(request: httpx.Request) -> httpx.Response:
+    nonlocal return_empty
+    calls.append(request)
+    if request.url.path.endswith("/api/search"):
+      if return_empty:
+        return httpx.Response(200, json={"traces": []})
+      return httpx.Response(
+        200,
+        json={
+          "traces": [
+            {
+              "traceID": trace_id,
+              "startTimeUnixNano": "1000000000",
+              "durationMs": 1.0,
+              "rootServiceName": "checkout-api",
+              "rootTraceName": "GET /checkout",
+            },
+          ],
+        },
+      )
+    if request.url.path.endswith(f"/api/traces/{trace_id}"):
+      return httpx.Response(
+        200,
+        json={
+          "batches": [
+            {
+              "resource": {
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {"stringValue": "checkout-api"},
+                  },
+                ],
+              },
+              "instrumentationLibrarySpans": [
+                {
+                  "spans": [
+                    {
+                      "traceId": trace_id,
+                      "spanId": "b" * 16,
+                      "parentSpanId": "c" * 16,
+                      "name": "GET /checkout",
+                      "startTimeUnixNano": "1000000000",
+                      "endTimeUnixNano": "2000000000",
+                      "status": {"code": 2, "message": "database timeout"},
+                      "attributes": [
+                        {
+                          "key": "http.response.status_code",
+                          "value": {"intValue": "503"},
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      )
+    return httpx.Response(404)
+
+  real_async_client = httpx.AsyncClient
+
+  def mock_async_client(*args, **kwargs):
+    kwargs["transport"] = httpx.MockTransport(handler)
+    return real_async_client(*args, **kwargs)
+
+  monkeypatch.setattr(trace_service.httpx, "AsyncClient", mock_async_client)
+  end = datetime.now(UTC)
+  start = end - timedelta(minutes=5)
+  body = {
+    "source_id": source_id,
+    "start": start.isoformat(),
+    "end": end.isoformat(),
+    "span_status": "error",
+    "limit": 5,
+  }
+  url = f"/projects/{project_id}/incidents/{incident.id}/traces"
+  first = await client.post(url, json=body, headers=_headers(owner))
+  repeated = await client.post(url, json=body, headers=_headers(owner))
+
+  assert first.status_code == repeated.status_code == 200
+  assert first.json()["status"] == "success"
+  assert first.json()["trace_count"] == 1
+  assert first.json()["span_count"] == 1
+  assert first.json()["evidence"]["id"] == repeated.json()["evidence"]["id"]
+  trace_evidence = first.json()["evidence"]["original_content"]["traces"][0]
+  span = trace_evidence["spans"][0]
+  assert trace_evidence["trace_id"] == trace_id
+  assert span["service_name"] == "checkout-api"
+  assert span["parent_span_id"] == "c" * 16
+  assert span["duration_ms"] == 1000
+  assert span["status"] == "error"
+  assert span["status_message"] == "database timeout"
+  assert span["attributes"]["http.response.status_code"] == 503
+  assert len(calls) == 4
+  assert calls[0].url.params["q"] == (
+    '{ status=error && resource.service.name="checkout-api" }'
+  )
+  assert calls[1].url.path == f"/api/traces/{trace_id}"
+
+  return_empty = True
+  empty_start = start - timedelta(minutes=1)
+  empty = await client.post(
+    url,
+    json={
+      **body,
+      "start": empty_start.isoformat(),
+      "end": (end - timedelta(minutes=1)).isoformat(),
+    },
+    headers=_headers(owner),
+  )
+  assert empty.status_code == 200
+  assert empty.json()["status"] == "empty"
+  assert empty.json()["trace_count"] == 0
+
+  by_trace_id = await client.post(
+    url,
+    json={**body, "trace_id": trace_id, "span_status": None},
+    headers=_headers(owner),
+  )
+  assert by_trace_id.status_code == 200
+  assert by_trace_id.json()["status"] == "success"
+  assert calls[-1].url.path == f"/api/traces/{trace_id}"
+
+  unbounded = await client.post(
+    url,
+    json={
+      **body,
+      "trace_id": None,
+      "service_name": None,
+      "start": (end - timedelta(hours=8)).isoformat(),
+    },
+    headers=_headers(owner),
+  )
+  assert unbounded.status_code == 422
+  async with session_factory() as session:
+    evidence = list(
+      await session.scalars(
+        select(IncidentEvidence).where(
+          IncidentEvidence.evidence_type == "trace_spans",
+        ),
+      ),
+    )
+    persisted_incident = await session.get(Incident, incident.id)
+  assert len(evidence) == 3
+  assert persisted_incident is not None
+  assert persisted_incident.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_tempo_auth_failure_and_timeout_do_not_create_incidents_or_evidence(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  monkeypatch.setattr(settings, "TRACE_ALLOWED_HOSTS", "tempo.test")
+  owner = await _create_user(session_factory, "tempo-failure-owner")
+  project_id = await _create_project(client, owner, "Tempo failure project")
+  source = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Unavailable Tempo",
+      "source_type": "traces",
+      "trace_backend": "tempo",
+      "trace_url": "https://tempo.test",
+      "trace_service_name": "checkout-api",
+    },
+    headers=_headers(owner),
+  )
+  incident = await _create_labeled_test_incident(session_factory, project_id)
+  end = datetime.now(UTC)
+  body = {
+    "source_id": source.json()["id"],
+    "start": (end - timedelta(minutes=5)).isoformat(),
+    "end": end.isoformat(),
+  }
+  real_async_client = httpx.AsyncClient
+
+  def mock_async_client(status_code: int):
+    return lambda *args, **kwargs: real_async_client(
+      transport=httpx.MockTransport(
+        lambda _request: httpx.Response(status_code, text="backend failure"),
+      ),
+      *args,
+      **kwargs,
+    )
+
+  monkeypatch.setattr(
+    trace_service.httpx,
+    "AsyncClient",
+    mock_async_client(401),
+  )
+  url = f"/projects/{project_id}/incidents/{incident.id}/traces"
+  unauthorized = await client.post(url, json=body, headers=_headers(owner))
+
+  def raise_timeout(*args, **kwargs):
+    raise httpx.ReadTimeout("timeout")
+
+  monkeypatch.setattr(trace_service.httpx, "AsyncClient", raise_timeout)
+  timed_out = await client.post(url, json=body, headers=_headers(owner))
+
+  assert unauthorized.status_code == 502
+  assert "backend failure" not in unauthorized.text
+  assert timed_out.status_code == 504
+  async with session_factory() as session:
+    evidence = list(
+      await session.scalars(
+        select(IncidentEvidence).where(
+          IncidentEvidence.evidence_type == "trace_spans",
+        ),
+      ),
+    )
+    persisted_incident = await session.get(Incident, incident.id)
+  assert evidence == []
+  assert persisted_incident is not None
+  assert persisted_incident.status == "open"
+
+
+@pytest.mark.asyncio
 async def test_alertmanager_batch_creates_incidents_and_retries_are_idempotent(
   source_client,
 ):
@@ -1546,3 +1918,465 @@ async def test_alertmanager_concurrent_repeated_firing_notifications_are_idempot
     )
   assert len(alerts) == 1
   assert len(incidents) == 1
+
+
+@pytest.mark.asyncio
+async def test_docker_source_endpoints_enforce_project_membership(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  owner = await _create_user(session_factory, "docker-owner")
+  member = await _create_user(session_factory, "docker-member")
+  outsider = await _create_user(session_factory, "docker-outsider")
+  project_id = await _create_project(client, owner, "Docker project")
+  await _create_member(session_factory, project_id, member)
+  source = await _create_source(
+    client,
+    project_id,
+    owner,
+    source_type="docker",
+  )
+  source_id = source.json()["id"]
+  monkeypatch.setattr(
+    docker_api,
+    "validate_docker_connection",
+    lambda: _async_result(
+      {"status": "connected", "daemon_version": "27.0", "api_version": "1.47"},
+    ),
+  )
+  monkeypatch.setattr(
+    docker_api,
+    "list_docker_containers",
+    lambda: _async_result(
+      {"containers": [], "limit": 100, "truncated": False},
+    ),
+  )
+
+  validate = await client.post(
+    f"/projects/{project_id}/sources/{source_id}/docker/validate",
+    headers=_headers(member),
+  )
+  listing = await client.get(
+    f"/projects/{project_id}/sources/{source_id}/docker/containers",
+    headers=_headers(member),
+  )
+  forbidden = await client.get(
+    f"/projects/{project_id}/sources/{source_id}/docker/containers",
+    headers=_headers(outsider),
+  )
+
+  assert source.status_code == 201
+  assert validate.status_code == 200
+  assert validate.json()["status"] == "connected"
+  assert listing.status_code == 200
+  assert listing.json()["containers"] == []
+  assert forbidden.status_code == 404
+
+
+async def _async_result(result):
+  return result
+
+
+@pytest.mark.asyncio
+async def test_docker_investigation_persists_deduplicated_incident_evidence(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  owner = await _create_user(session_factory, "docker-evidence-owner")
+  project_id = await _create_project(client, owner, "Docker evidence project")
+  source = await _create_source(
+    client,
+    project_id,
+    owner,
+    source_type="docker",
+  )
+  source_id = uuid.UUID(source.json()["id"])
+  incident = await _create_labeled_test_incident(session_factory, project_id)
+
+  is_available = True
+
+  async def collect(source_uuid, project_uuid, container_id, log_tail_lines):
+    evidence = (
+      {"container": {"state": {"status": "running"}}}
+      if is_available
+      else None
+    )
+    return {
+      "status": "success" if is_available else "unavailable",
+      "source_id": str(source_uuid),
+      "project_id": str(project_uuid),
+      "container_id": container_id,
+      "collected_at": "2026-01-02T03:04:05+00:00",
+      "query_criteria": {
+        "container_id": container_id,
+        "log_tail_lines": log_tail_lines,
+        "event_lookback_seconds": 300,
+      },
+      "query_time_range": {
+        "start": "2026-01-02T02:59:05+00:00",
+        "end": "2026-01-02T03:04:05+00:00",
+      },
+      "evidence": evidence,
+      "unavailable": [] if is_available else ["daemon"],
+      "errors": [] if is_available else [
+        {"component": "daemon", "detail": "Docker daemon is unavailable"},
+      ],
+      "findings": [],
+    }
+
+  monkeypatch.setattr(docker_api, "collect_docker_investigation", collect)
+  body = {
+    "source_id": str(source_id),
+    "incident_id": str(incident.id),
+    "container_id": "a" * 64,
+    "log_tail_lines": 25,
+  }
+  url = f"/projects/{project_id}/docker/investigations"
+  first = await client.post(url, json=body, headers=_headers(owner))
+  second = await client.post(url, json=body, headers=_headers(owner))
+  is_available = False
+  unavailable = await client.post(url, json=body, headers=_headers(owner))
+
+  assert first.status_code == second.status_code == 200
+  assert first.json()["incident_evidence_id"] == second.json()["incident_evidence_id"]
+  assert unavailable.status_code == 200
+  assert unavailable.json()["status"] == "unavailable"
+  assert unavailable.json()["incident_evidence_id"] == first.json()["incident_evidence_id"]
+  assert first.json()["query_criteria"]["log_tail_lines"] == 25
+  async with session_factory() as session:
+    evidence = list(
+      await session.scalars(
+        select(IncidentEvidence).where(
+          IncidentEvidence.incident_id == incident.id,
+          IncidentEvidence.evidence_type == "docker_investigation",
+        ),
+      ),
+    )
+  assert len(evidence) == 1
+  assert evidence[0].incident_source_id == source_id
+  assert evidence[0].normalized_content["retrieval_status"] == "unavailable"
+  assert evidence[0].normalized_content["evidence_provenance"]["source_type"] == "docker"
+  assert evidence[0].normalized_content["query_time_range"]["start"].startswith(
+    "2026-01-02T02:59:05",
+  )
+
+
+@pytest.mark.asyncio
+async def test_combined_incident_investigation_collects_all_available_evidence(
+  source_client,
+  monkeypatch,
+):
+  from app.core.exceptions import GitHubIntegrationError
+  from app.services.loki_service import LokiQueryResult
+  from app.services.trace_service import TraceQueryResult
+
+  client, session_factory, _redis = source_client
+  owner = await _create_user(session_factory, "combined-investigation-owner")
+  project_id = await _create_project(
+    client,
+    owner,
+    "Combined investigation project",
+  )
+  incident = await _create_labeled_test_incident(session_factory, project_id)
+  trace_source_id = uuid.uuid4()
+  loki_source_id = uuid.uuid4()
+  docker_source_id = uuid.uuid4()
+  github_event_id = uuid.uuid4()
+  github_repository_id = 7654321
+  async with session_factory() as session:
+    session.add_all(
+      [
+        IncidentSource(
+          id=trace_source_id,
+          project_id=project_id,
+          name="Combined Tempo",
+          source_type="traces",
+          trace_backend="tempo",
+          trace_url="http://tempo.test:3200",
+          trace_auth_type="none",
+          trace_service_name="checkout-api",
+          trace_resource_attributes={},
+          credential_hash="a" * 64,
+        ),
+        IncidentSource(
+          id=loki_source_id,
+          project_id=project_id,
+          name="Combined Loki",
+          source_type="loki",
+          loki_url="http://loki.test:3100",
+          loki_auth_type="none",
+          credential_hash="b" * 64,
+        ),
+        IncidentSource(
+          id=docker_source_id,
+          project_id=project_id,
+          name="Combined Docker",
+          source_type="docker",
+          credential_hash="c" * 64,
+        ),
+      ],
+    )
+    installation = GitHubInstallation(
+      project_id=project_id,
+      installation_id=98765,
+      account_login="example",
+      status="active",
+    )
+    session.add(installation)
+    await session.flush()
+    repository = GitHubRepository(
+      project_id=project_id,
+      installation_id=installation.id,
+      github_repo_id=github_repository_id,
+      full_name="example/checkout",
+      owner="example",
+      html_url="https://github.com/example/checkout",
+      status="active",
+    )
+    session.add(repository)
+    await session.flush()
+    session.add(
+      GitHubWebhookEvent(
+        id=github_event_id,
+        project_id=project_id,
+        github_repository_id=repository.id,
+        delivery_id="combined-failed-workflow",
+        event_name="workflow_run",
+        action="completed",
+        payload={
+          "workflow_run": {
+            "id": 321,
+            "head_sha": "d" * 40,
+            "conclusion": "failure",
+          },
+        },
+      ),
+    )
+    alert_evidence = await session.scalar(
+      select(IncidentEvidence).where(
+        IncidentEvidence.incident_id == incident.id,
+        IncidentEvidence.evidence_type == "grafana_notification",
+      ),
+    )
+    assert alert_evidence is not None
+    alert_evidence.original_content = {
+      "alert": {
+        "labels": {"service": "api", "environment": "test"},
+        "generatorURL": "https://prometheus.example/graph",
+      },
+    }
+    await session.commit()
+
+  start = datetime.now(UTC) - timedelta(minutes=5)
+  end = datetime.now(UTC)
+  trace_id = "1" * 32
+  github_available = True
+
+  async def query_traces(_connection, query):
+    return TraceQueryResult(
+      status="success",
+      traces=[
+        {
+          "trace_id": trace_id,
+          "spans": [{"span_id": "2" * 16, "service_name": "checkout-api"}],
+        },
+      ],
+      query={"trace_id": query.trace_id, "service_name": query.service_name},
+      query_hash="trace-combined-query",
+      start=query.start,
+      end=query.end,
+      retrieved_at=datetime.now(UTC),
+    )
+
+  async def query_logs(_connection, query, query_start, query_end, _limit):
+    assert query == '{environment="test",service="api"}'
+    return LokiQueryResult(
+      status="success",
+      entries=[{"timestamp": query_end.isoformat(), "line": "request failed"}],
+      query=query,
+      query_hash="loki-combined-query",
+      start=query_start,
+      end=query_end,
+      retrieved_at=datetime.now(UTC),
+    )
+
+  async def collect_docker(
+    source_id,
+    requested_project_id,
+    container_id,
+    log_tail_lines,
+  ):
+    assert source_id == docker_source_id
+    assert requested_project_id == project_id
+    assert container_id == "e" * 64
+    assert log_tail_lines == 50
+    return {
+      "status": "success",
+      "source_id": str(source_id),
+      "project_id": str(requested_project_id),
+      "container_id": container_id,
+      "collected_at": datetime.now(UTC).isoformat(),
+      "query_criteria": {"container_id": container_id},
+      "query_time_range": {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+      },
+      "evidence": {"container": {"state": {"status": "exited", "exit_code": 1}}},
+      "unavailable": [],
+      "errors": [],
+      "findings": [{"code": "container_nonzero_exit"}],
+    }
+
+  async def github_context(
+    _session,
+    requested_project_id,
+    requested_repository_id,
+    requested_event_id,
+    _user,
+  ):
+    if not github_available:
+      raise GitHubIntegrationError(503, "Mock GitHub outage")
+    assert requested_project_id == project_id
+    assert requested_repository_id == github_repository_id
+    assert requested_event_id == github_event_id
+    return {
+      "event_id": str(github_event_id),
+      "repository": "example/checkout",
+      "workflow_run": {"id": 321, "conclusion": "failure"},
+      "jobs": [{"name": "tests", "conclusion": "failure"}],
+      "commit": {"sha": "d" * 40},
+      "code_files": [],
+      "code_files_unavailable": [],
+      "code_files_truncated": False,
+      "commit_history": [],
+      "logs": "test assertion failed",
+      "logs_available": True,
+      "logs_truncated": False,
+    }
+
+  monkeypatch.setattr(trace_service, "query_tempo", query_traces)
+  monkeypatch.setattr(
+    incident_investigation_service,
+    "query_loki",
+    query_logs,
+  )
+  monkeypatch.setattr(
+    incident_investigation_service,
+    "collect_docker_investigation",
+    collect_docker,
+  )
+  monkeypatch.setattr(
+    incident_investigation_service.github_project_service,
+    "get_workflow_event_investigation",
+    github_context,
+  )
+
+  investigation_request = {
+    "traces": {
+      "source_id": str(trace_source_id),
+      "trace_id": trace_id,
+      "start": start.isoformat(),
+      "end": end.isoformat(),
+    },
+    "loki": {
+      "source_id": str(loki_source_id),
+      "start": start.isoformat(),
+      "end": end.isoformat(),
+      "labels": {"service": "api", "environment": "test"},
+    },
+    "docker": {
+      "source_id": str(docker_source_id),
+      "container_id": "e" * 64,
+      "log_tail_lines": 50,
+    },
+    "github": {
+      "repository_id": github_repository_id,
+      "event_id": str(github_event_id),
+    },
+  }
+  investigation_url = (
+    f"/projects/{project_id}/incidents/{incident.id}/investigate"
+  )
+  response = await client.post(
+    investigation_url,
+    headers=_headers(owner),
+    json=investigation_request,
+  )
+
+  assert response.status_code == 200, response.text
+  result = response.json()
+  assert result["integrations"]["loki"]["status"] == "success", (
+    result["integrations"]["loki"]
+  )
+  assert {
+    name: result["integrations"][name]["status"]
+    for name in ("traces", "loki", "docker", "github")
+  } == {
+    "traces": "success",
+    "loki": "success",
+    "docker": "success",
+    "github": "success",
+  }
+  assert result["status"] == "success"
+  assert result["integrations"]["grafana"]["status"] == "included"
+  assert result["integrations"]["prometheus"]["status"] == "not_configured"
+  assert result["integrations"]["prometheus"]["detail"].startswith(
+    "There is no direct Prometheus query integration.",
+  )
+  evidence_types = {item["evidence_type"] for item in result["evidence"]}
+  assert {
+    "grafana_notification",
+    "trace_spans",
+    "loki_logs",
+    "docker_investigation",
+    "github_context",
+  } <= evidence_types
+  grafana_evidence = next(
+    item
+    for item in result["evidence"]
+    if item["evidence_type"] == "grafana_notification"
+  )
+  assert (
+    grafana_evidence["original_content"]["alert"]["generatorURL"]
+    == "https://prometheus.example/graph"
+  )
+  assert result["integrations"]["github"]["evidence_id"] in {
+    item["id"]
+    for item in result["evidence"]
+    if item["evidence_type"] == "github_context"
+  }
+
+  github_available = False
+  partial_response = await client.post(
+    investigation_url,
+    headers=_headers(owner),
+    json=investigation_request,
+  )
+  assert partial_response.status_code == 200
+  partial_result = partial_response.json()
+  assert partial_result["status"] == "partial"
+  assert partial_result["integrations"]["github"]["status"] == "unavailable"
+  assert partial_result["integrations"]["traces"]["status"] == "success"
+  assert partial_result["integrations"]["loki"]["status"] == "success"
+  assert partial_result["integrations"]["docker"]["status"] == "success"
+
+  github_available = True
+  repeated = await client.post(
+    investigation_url,
+    headers=_headers(owner),
+    json={
+      "github": {
+        "repository_id": github_repository_id,
+        "event_id": str(github_event_id),
+      },
+    },
+  )
+  assert repeated.status_code == 200
+  github_evidence = [
+    item
+    for item in repeated.json()["evidence"]
+    if item["evidence_type"] == "github_context"
+  ]
+  assert len(github_evidence) == 1

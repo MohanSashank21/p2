@@ -7,12 +7,14 @@ from sqlalchemy import (
   CheckConstraint,
   DateTime,
   ForeignKey,
+  Index,
   JSON,
   String,
   Text,
   UniqueConstraint,
   Uuid,
   func,
+  text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -106,7 +108,7 @@ class IncidentEvidence(Base):
     CheckConstraint(
       "evidence_type IN ('manual_report', 'webhook_payload', "
       "'alertmanager_notification', 'grafana_notification', 'loki_logs', "
-      "'github_context')",
+      "'github_context', 'trace_spans', 'docker_investigation')",
       name="ck_incident_evidence_type",
     ),
     UniqueConstraint(
@@ -123,6 +125,18 @@ class IncidentEvidence(Base):
       "incident_id",
       "query_hash",
       name="uq_incident_evidence_loki_query",
+    ),
+    Index(
+      "uq_incident_evidence_github_context_event",
+      "incident_id",
+      "query_hash",
+      unique=True,
+      postgresql_where=text(
+        "evidence_type = 'github_context' AND query_hash IS NOT NULL",
+      ),
+      sqlite_where=text(
+        "evidence_type = 'github_context' AND query_hash IS NOT NULL",
+      ),
     ),
   )
 

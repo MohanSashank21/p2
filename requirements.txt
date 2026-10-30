@@ -10,3 +10,4 @@ email-validator
 redis>=5,<7
 httpx
 cryptography
+docker>=7,<8

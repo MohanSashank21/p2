@@ -15,6 +15,7 @@ from app.core.exceptions import (
   RateLimitExceededError,
   SourceConfigurationError,
   SourceNotFoundError,
+  TraceIntegrationError,
 )
 from app.db.database import get_db
 from app.db.incident import Incident, IncidentEvidence
@@ -27,8 +28,13 @@ from app.schemas.incident_schema import (
   IncidentResponse,
   IncidentStatusUpdateRequest,
   LokiQueryResponse,
+  TraceQueryResponse,
 )
-from app.schemas.source_schema import LokiQueryRequest
+from app.schemas.investigation_schema import (
+  CombinedIncidentInvestigationRequest,
+  CombinedIncidentInvestigationResponse,
+)
+from app.schemas.source_schema import LokiQueryRequest, TraceQueryRequest
 from app.services.incident_service import (
   create_manual_incident,
   get_incident_log_labels,
@@ -37,6 +43,9 @@ from app.services.incident_service import (
   list_project_incidents,
   update_incident_status,
 )
+from app.services.incident_investigation_service import (
+  investigate_incident_integrations,
+)
 from app.services.loki_service import (
   LokiConnection,
   persist_loki_evidence,
@@ -44,6 +53,11 @@ from app.services.loki_service import (
 )
 from app.services.redis_service import rate_limit_loki_queries
 from app.services.source_service import get_project_loki_source
+from app.services.source_service import get_project_trace_source
+from app.services.trace_service import (
+  TraceQuery,
+  retrieve_incident_traces,
+)
 
 router = APIRouter(prefix="/projects/{project_id}/incidents", tags=["incidents"])
 
@@ -173,6 +187,50 @@ async def get_incident_evidence(
     raise _raise_access_error(error) from error
   return [_evidence_response(item) for item in evidence]
 
+@router.post(
+  "/{incident_id}/investigate",
+  response_model=CombinedIncidentInvestigationResponse,
+)
+async def investigate_incident_integrations_endpoint(
+  project_id: uuid.UUID,
+  incident_id: uuid.UUID,
+  request: CombinedIncidentInvestigationRequest,
+  user: User = Depends(get_current_user),
+  redis: Redis = Depends(get_redis),
+  session: AsyncSession = Depends(get_db),
+) -> CombinedIncidentInvestigationResponse:
+  try:
+    incident = await get_project_incident(
+      session,
+      project_id,
+      incident_id,
+      user,
+    )
+  except (ProjectNotFoundError, IncidentNotFoundError, PermissionDeniedError) as error:
+    raise _raise_access_error(error) from error
+
+  scoped_incident_id = incident_id
+  aggregate_status, integrations = await investigate_incident_integrations(
+    session,
+    redis,
+    project_id,
+    scoped_incident_id,
+    user,
+    request,
+  )
+  evidence = await list_incident_evidence(
+    session,
+    project_id,
+    scoped_incident_id,
+    user,
+  )
+  return CombinedIncidentInvestigationResponse(
+    status=aggregate_status,
+    incident_id=scoped_incident_id,
+    integrations=integrations,
+    evidence=[_evidence_response(item) for item in evidence],
+  )
+
 @router.post("/{incident_id}/loki-logs", response_model=LokiQueryResponse)
 async def retrieve_loki_logs(
   project_id: uuid.UUID,
@@ -267,5 +325,104 @@ async def retrieve_loki_logs(
   return LokiQueryResponse(
     status=result.status,
     entry_count=len(result.entries),
+    evidence=_evidence_response(evidence),
+  )
+
+
+@router.post("/{incident_id}/traces", response_model=TraceQueryResponse)
+async def retrieve_incident_traces_endpoint(
+  project_id: uuid.UUID,
+  incident_id: uuid.UUID,
+  request: TraceQueryRequest,
+  user: User = Depends(get_current_user),
+  redis: Redis = Depends(get_redis),
+  session: AsyncSession = Depends(get_db),
+) -> TraceQueryResponse:
+  try:
+    incident = await get_project_incident(
+      session,
+      project_id,
+      incident_id,
+      user,
+    )
+    source = await get_project_trace_source(
+      session,
+      project_id,
+      request.source_id,
+      user,
+    )
+  except (ProjectNotFoundError, IncidentNotFoundError, PermissionDeniedError) as error:
+    raise _raise_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  except SourceConfigurationError as error:
+    raise HTTPException(status_code=409, detail=str(error)) from error
+
+  is_trace_id_query = request.trace_id is not None
+  service_name = request.service_name or (
+    source.trace_service_name if not is_trace_id_query else None
+  )
+  resource_attributes = (
+    dict(request.resource_attributes)
+    if is_trace_id_query
+    else {
+      **(source.trace_resource_attributes or {}),
+      **request.resource_attributes,
+    }
+  )
+  if request.trace_id is None and not (
+    service_name
+    or resource_attributes
+    or request.span_attributes
+  ):
+    raise HTTPException(
+      status_code=422,
+      detail=(
+        "Provide a trace ID, service name, or resource/span attributes; "
+        "unfiltered trace searches are not allowed"
+      ),
+    )
+  now = datetime.now(UTC)
+  if request.start > now or request.end > now + timedelta(minutes=1):
+    raise HTTPException(
+      status_code=422,
+      detail="Trace query times cannot be in the future",
+    )
+  query = TraceQuery(
+    trace_id=request.trace_id,
+    service_name=service_name,
+    span_status=request.span_status,
+    resource_attributes=resource_attributes,
+    span_attributes=request.span_attributes,
+    start=request.start,
+    end=request.end,
+    limit=request.limit,
+  )
+  try:
+    result, evidence = await retrieve_incident_traces(
+      session,
+      redis,
+      project_id,
+      incident.id,
+      source,
+      query,
+    )
+  except RateLimitExceededError as error:
+    raise HTTPException(
+      status_code=429,
+      detail=str(error),
+      headers={"Retry-After": "60"},
+    ) from error
+  except TraceIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
+  except SourceConfigurationError as error:
+    raise HTTPException(status_code=409, detail=str(error)) from error
+  return TraceQueryResponse(
+    status=result.status,
+    trace_count=len(result.traces),
+    span_count=sum(len(trace["spans"]) for trace in result.traces),
     evidence=_evidence_response(evidence),
   )

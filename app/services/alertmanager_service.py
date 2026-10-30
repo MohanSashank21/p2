@@ -19,12 +19,10 @@ from app.schemas.source_schema import (
 _ZERO_TIMESTAMP_YEAR = 1
 AlertProvider = Literal["alertmanager", "grafana"]
 
-
 def _utc(value: datetime) -> datetime:
   if value.tzinfo is None:
     return value.replace(tzinfo=UTC)
   return value.astimezone(UTC)
-
 
 def _severity(labels: dict[str, str]) -> Literal["low", "medium", "high", "critical"]:
   value = labels.get("severity", "").strip().lower()
@@ -35,7 +33,6 @@ def _severity(labels: dict[str, str]) -> Literal["low", "medium", "high", "criti
   if value in {"low", "info", "informational"}:
     return "low"
   return "medium"
-
 
 def _title(alert: AlertmanagerAlertPayload, provider: AlertProvider) -> str:
   return (

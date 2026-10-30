@@ -60,6 +60,8 @@ class IncidentEvidenceResponse(BaseModel):
     "grafana_notification",
     "loki_logs",
     "github_context",
+    "trace_spans",
+    "docker_investigation",
   ]
   incident_source_id: uuid.UUID | None = None
   original_content: dict
@@ -70,4 +72,11 @@ class IncidentEvidenceResponse(BaseModel):
 class LokiQueryResponse(BaseModel):
   status: Literal["success", "empty"]
   entry_count: int
+  evidence: IncidentEvidenceResponse
+
+
+class TraceQueryResponse(BaseModel):
+  status: Literal["success", "empty"]
+  trace_count: int
+  span_count: int
   evidence: IncidentEvidenceResponse

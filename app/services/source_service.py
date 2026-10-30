@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import secrets
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -11,6 +12,7 @@ from app.core.exceptions import (
   LokiIntegrationError,
   PermissionDeniedError,
   SourceConfigurationError,
+  TraceIntegrationError,
   ProjectNotFoundError,
   SourceConflictError,
   SourceCredentialError,
@@ -24,10 +26,17 @@ from app.schemas.source_schema import (
   IncomingSourceEvent,
   LokiSourceConfigurationRequest,
   SourceCreateRequest,
+  TraceSourceConfigurationRequest,
 )
 from app.services.incident_service import create_webhook_incident
 from app.services.loki_service import encrypt_loki_auth, validate_loki_url
 from app.services.project_service import get_accessible_project
+from app.services.trace_service import (
+  TempoConnection,
+  encrypt_trace_auth,
+  validate_tempo_connection,
+  validate_tempo_url,
+)
 
 
 def _credential_hash(credential: str) -> str:
@@ -56,6 +65,8 @@ async def create_source(
 
   loki_url = None
   loki_auth_ciphertext = None
+  trace_url = None
+  trace_auth_ciphertext = None
   if request.source_type == "loki":
     if request.loki_url is None:
       raise LokiIntegrationError(422, "loki_url is required for Loki sources")
@@ -66,6 +77,17 @@ async def create_source(
       request.loki_username,
       request.loki_password,
       request.loki_bearer_token,
+    )
+  if request.source_type == "traces":
+    if request.trace_url is None:
+      raise TraceIntegrationError(422, "trace_url is required for trace sources")
+    validate_tempo_url(str(request.trace_url))
+    trace_url = str(request.trace_url).rstrip("/")
+    trace_auth_ciphertext = encrypt_trace_auth(
+      request.trace_auth_type,
+      request.trace_username,
+      request.trace_password,
+      request.trace_bearer_token,
     )
 
   credential = secrets.token_urlsafe(32)
@@ -80,6 +102,21 @@ async def create_source(
       request.loki_auth_type if request.source_type == "loki" else None
     ),
     loki_auth_ciphertext=loki_auth_ciphertext,
+    trace_backend=request.trace_backend if request.source_type == "traces" else None,
+    trace_url=trace_url,
+    trace_tenant_id=(
+      request.trace_tenant_id if request.source_type == "traces" else None
+    ),
+    trace_auth_type=(
+      request.trace_auth_type if request.source_type == "traces" else None
+    ),
+    trace_auth_ciphertext=trace_auth_ciphertext,
+    trace_service_name=(
+      request.trace_service_name if request.source_type == "traces" else None
+    ),
+    trace_resource_attributes=(
+      request.trace_resource_attributes if request.source_type == "traces" else None
+    ),
     credential_hash=_credential_hash(credential),
     enabled=True,
   )
@@ -116,6 +153,111 @@ async def update_loki_source(
     request.loki_bearer_token,
   )
   source.enabled = request.enabled
+  await session.commit()
+  await session.refresh(source)
+  return source
+
+
+async def update_trace_source(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+  request: TraceSourceConfigurationRequest,
+) -> IncidentSource:
+  source = await _get_managed_source(session, project_id, source_id, user)
+  if source.source_type != "traces":
+    raise SourceNotFoundError("Trace source not found")
+  validate_tempo_url(str(request.trace_url))
+  source.trace_backend = request.trace_backend
+  source.trace_url = str(request.trace_url).rstrip("/")
+  source.trace_tenant_id = request.trace_tenant_id
+  source.trace_auth_type = request.trace_auth_type
+  source.trace_auth_ciphertext = encrypt_trace_auth(
+    request.trace_auth_type,
+    request.trace_username,
+    request.trace_password,
+    request.trace_bearer_token,
+  )
+  source.trace_service_name = request.trace_service_name
+  source.trace_resource_attributes = request.trace_resource_attributes
+  source.trace_connection_status = "not_checked"
+  source.trace_last_checked_at = None
+  source.enabled = request.enabled
+  await session.commit()
+  await session.refresh(source)
+  return source
+
+
+async def get_project_trace_source(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+) -> IncidentSource:
+  await get_accessible_project(session, project_id, user)
+  source = await session.scalar(
+    select(IncidentSource).where(
+      IncidentSource.id == source_id,
+      IncidentSource.project_id == project_id,
+      IncidentSource.source_type == "traces",
+    ),
+  )
+  if source is None:
+    raise SourceNotFoundError("Trace source not found in this project")
+  if not source.enabled:
+    raise SourceConfigurationError("Trace source is disabled")
+  if source.trace_backend != "tempo" or source.trace_url is None:
+    raise SourceConfigurationError("Trace source is not configured")
+  return source
+
+
+async def get_project_docker_source(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+) -> IncidentSource:
+  await get_accessible_project(session, project_id, user)
+  source = await session.scalar(
+    select(IncidentSource).where(
+      IncidentSource.id == source_id,
+      IncidentSource.project_id == project_id,
+      IncidentSource.source_type == "docker",
+    ),
+  )
+  if source is None:
+    raise SourceNotFoundError("Docker source not found in this project")
+  if not source.enabled:
+    raise SourceConfigurationError("Docker source is disabled")
+  return source
+
+
+async def validate_trace_source_connection(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+) -> IncidentSource:
+  source = await _get_managed_source(session, project_id, source_id, user)
+  if source.source_type != "traces":
+    raise SourceNotFoundError("Trace source not found")
+  if source.trace_backend != "tempo" or source.trace_url is None:
+    raise SourceConfigurationError("Trace source is not configured")
+  connection = TempoConnection(
+    base_url=source.trace_url,
+    tenant_id=source.trace_tenant_id,
+    auth_type=source.trace_auth_type or "none",
+    auth_ciphertext=source.trace_auth_ciphertext,
+  )
+  source.trace_last_checked_at = datetime.now(UTC)
+  try:
+    await validate_tempo_connection(connection)
+  except TraceIntegrationError:
+    source.trace_connection_status = "unavailable"
+    await session.commit()
+    raise
+  source.trace_connection_status = "connected"
   await session.commit()
   await session.refresh(source)
   return source

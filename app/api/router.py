@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.auth import router as auth_router
+from app.api.docker import router as docker_router
 from app.api.github import (
   github_webhook_router,
   router as github_router,
@@ -17,5 +18,6 @@ api_router.include_router(auth_router)
 api_router.include_router(projects_router)
 api_router.include_router(incidents_router)
 api_router.include_router(sources_router)
+api_router.include_router(docker_router)
 api_router.include_router(github_router)
 api_router.include_router(github_webhook_router)

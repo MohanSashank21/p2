@@ -405,7 +405,7 @@ requires PostgreSQL. No live integrations were contacted.
 
 ### M1 — Direct Prometheus source configuration and validation
 
-**Status:** In progress; M1.1 and M1.2 implemented and awaiting review.
+**Status:** In progress; M1.1, M1.2, and M1.3 implemented and awaiting review.
 
 **Objective:** Reuse project source management to configure a Prometheus
 endpoint safely, enforce server-side host allowlisting and bounded
@@ -413,8 +413,8 @@ authentication configuration, and provide an owner-only connection check.
 
 **Small increments:** (1) source schema/model/migration and project-scoped
 service validation; (2) credential protection and source API contract; (3)
-connection validation tests. Do not query arbitrary PromQL or alter existing
-Grafana/Alertmanager webhook contracts in this milestone.
+owner-only connection validation. Do not query arbitrary PromQL or alter
+existing Grafana/Alertmanager webhook contracts in this milestone.
 
 #### M1.1 — Prometheus source schema and project-scoped configuration
 
@@ -463,6 +463,27 @@ Full suite after M1.1/M1.2: 94 passed, 1 skipped.
 Pylance diagnostics for changed application files are empty apart from two
 existing unused `_project` warnings in `source_service.py`. No live database
 migration or Prometheus connection was run.
+
+#### M1.3 — Owner-only Prometheus connection validation
+
+**Status:** Implemented; awaiting review.
+
+**Implemented:** Added an owner-only `POST .../prometheus/validate` route that
+checks the configured endpoint's `/-/ready` path with stored bearer/basic
+authentication. Requests use the existing exact-host allowlist, a bounded
+timeout, disabled redirects, and no environment-proxy inheritance. Only the
+HTTP status is used; upstream response bodies and credentials are not exposed.
+The source stores `not_checked`, `connected`, or `unavailable` plus the last
+check timestamp. Updating configuration resets that status. Added a database
+migration, source response fields, timeout setting, and setup documentation.
+This confirms readiness and configured authentication, not permission to query
+metrics.
+
+**Verification:** Prometheus-focused source tests: 5 passed. Migration head
+reports the new revision, and the migration compiles when targeted directly.
+Source suite: 33 passed, 1 skipped. Full suite after M1.3: 96 passed,
+1 skipped; the skipped PostgreSQL row-lock concurrency test requires
+PostgreSQL. No live Prometheus endpoint or database migration was run.
 
 ### M2 — Bounded, read-only Prometheus query client
 
@@ -608,13 +629,13 @@ production outage or destructive test is performed.
 - **Blocked/not attempted:** Live PostgreSQL migration state, real Redis Lua
   behavior, external observability endpoints, GitHub App connectivity, and
   real Docker daemon verification.
-- **Pending:** Review of M1.1/M1.2 source configuration changes and separate
-  approval before starting M1.3 connection validation.
-- **Not started:** M1.3 connection validation; Prometheus query/evidence
+- **Pending:** Review of M1.1/M1.2/M1.3 changes and separate approval before
+  starting M2, the bounded Prometheus query client.
+- **Not started:** M2 Prometheus query client; M3 Prometheus evidence
   integration; deterministic correlation; durable runs; AI planning/synthesis;
   frontend investigation review.
 
-After M1.1/M1.2 review and approval, the next increment is **M1.3: owner-only
-Prometheus connection validation**. Prometheus querying and the AI tool adapter
-remain unimplemented. No subsequent increment is authorized until the current
-diff is reviewed. The user makes all commits and pushes.
+After M1.1/M1.2/M1.3 review and approval, the next increment is **M2: bounded,
+read-only Prometheus metric queries**. Prometheus incident evidence and its AI
+tool adapter remain unimplemented. No subsequent increment is authorized until
+the current diff is reviewed. The user makes all commits and pushes.

@@ -231,6 +231,13 @@ direct query integration: Prometheus alert metadata is available only when
 included in a Grafana or Alertmanager notification; OpsPilot does not yet
 execute PromQL or fetch Prometheus time series.
 
+Project owners can test the configured endpoint with
+`POST /projects/{project_id}/sources/{source_id}/prometheus/validate`. The
+check requests Prometheus's `/-/ready` endpoint without following redirects,
+and applies `PROMETHEUS_QUERY_TIMEOUT_SECONDS`. The source reports the latest
+connection status and check time; this check confirms reachability and
+authentication, not metric-query permissions.
+
 ### Instrument a FastAPI application
 
 Install the SDK, OTLP exporter, and FastAPI instrumentation in the application

@@ -34,7 +34,9 @@ from app.services.incident_service import create_webhook_incident
 from app.services.loki_service import encrypt_loki_auth, validate_loki_url
 from app.services.project_service import get_accessible_project
 from app.services.prometheus_service import (
+  PrometheusConnection,
   encrypt_prometheus_auth,
+  validate_prometheus_connection,
   validate_prometheus_url,
 )
 from app.services.trace_service import (
@@ -180,6 +182,8 @@ async def update_prometheus_source(
   source.prometheus_auth_type = request.prometheus_auth_type
   source.prometheus_auth_ciphertext = auth_ciphertext
   source.enabled = request.enabled
+  source.prometheus_connection_status = "not_checked"
+  source.prometheus_last_checked_at = None
   await session.commit()
   await session.refresh(source)
   return source
@@ -334,6 +338,36 @@ async def validate_trace_source_connection(
     await session.commit()
     raise
   source.trace_connection_status = "connected"
+  await session.commit()
+  await session.refresh(source)
+  return source
+
+
+async def validate_prometheus_source_connection(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+) -> IncidentSource:
+  source = await _get_managed_source(session, project_id, source_id, user)
+  if source.source_type != "prometheus":
+    raise SourceNotFoundError("Prometheus source not found")
+  if source.prometheus_url is None:
+    raise SourceConfigurationError("Prometheus source is not configured")
+
+  connection = PrometheusConnection(
+    base_url=source.prometheus_url,
+    auth_type=source.prometheus_auth_type or "none",
+    auth_ciphertext=source.prometheus_auth_ciphertext,
+  )
+  source.prometheus_last_checked_at = datetime.now(UTC)
+  try:
+    await validate_prometheus_connection(connection)
+  except PrometheusIntegrationError:
+    source.prometheus_connection_status = "unavailable"
+    await session.commit()
+    raise
+  source.prometheus_connection_status = "connected"
   await session.commit()
   await session.refresh(source)
   return source

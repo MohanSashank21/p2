@@ -32,6 +32,10 @@ class IncidentSource(Base):
       "trace_connection_status IN ('not_checked', 'connected', 'unavailable')",
       name="ck_incident_sources_trace_connection_status",
     ),
+    CheckConstraint(
+      "prometheus_connection_status IN ('not_checked', 'connected', 'unavailable')",
+      name="ck_incident_sources_prometheus_connection_status",
+    ),
   )
 
   id: Mapped[uuid.UUID] = mapped_column(
@@ -65,6 +69,16 @@ class IncidentSource(Base):
   prometheus_url: Mapped[str | None] = mapped_column(Text, nullable=True)
   prometheus_auth_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
   prometheus_auth_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+  prometheus_connection_status: Mapped[str] = mapped_column(
+    String(16),
+    nullable=False,
+    default="not_checked",
+    server_default="not_checked",
+  )
+  prometheus_last_checked_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+  )
   trace_backend: Mapped[str | None] = mapped_column(String(32), nullable=True)
   trace_url: Mapped[str | None] = mapped_column(Text, nullable=True)
   trace_tenant_id: Mapped[str | None] = mapped_column(String(255), nullable=True)

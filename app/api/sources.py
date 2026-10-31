@@ -56,6 +56,7 @@ from app.services.source_service import (
   update_trace_source,
   update_loki_source,
   update_prometheus_source,
+  validate_prometheus_source_connection,
   validate_trace_source_connection,
 )
 
@@ -109,6 +110,8 @@ def _source_response(source: IncidentSource) -> SourceResponse:
     prometheus_url=source.prometheus_url,
     prometheus_auth_type=source.prometheus_auth_type,
     prometheus_auth_configured=source.prometheus_auth_ciphertext is not None,
+    prometheus_connection_status=source.prometheus_connection_status,
+    prometheus_last_checked_at=source.prometheus_last_checked_at,
     trace_backend=source.trace_backend,
     trace_url=source.trace_url,
     trace_tenant_id=source.trace_tenant_id,
@@ -414,6 +417,37 @@ async def disable_project_source(
     raise _raise_project_access_error(error) from error
   except SourceNotFoundError as error:
     raise HTTPException(status_code=404, detail=str(error)) from error
+  return _source_response(source)
+
+
+@router.post(
+  "/projects/{project_id}/sources/{source_id}/prometheus/validate",
+  response_model=SourceResponse,
+)
+async def validate_prometheus_source(
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> SourceResponse:
+  try:
+    source = await validate_prometheus_source_connection(
+      session,
+      project_id,
+      source_id,
+      user,
+    )
+  except (ProjectNotFoundError, PermissionDeniedError) as error:
+    raise _raise_project_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  except SourceConfigurationError as error:
+    raise HTTPException(status_code=409, detail=str(error)) from error
+  except PrometheusIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
   return _source_response(source)
 
 

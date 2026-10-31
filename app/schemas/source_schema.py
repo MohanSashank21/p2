@@ -441,6 +441,12 @@ class SourceResponse(BaseModel):
   prometheus_url: str | None = None
   prometheus_auth_type: str | None = None
   prometheus_auth_configured: bool = False
+  prometheus_connection_status: Literal[
+    "not_checked",
+    "connected",
+    "unavailable",
+  ] = "not_checked"
+  prometheus_last_checked_at: datetime | None = None
   trace_backend: str | None = None
   trace_url: str | None = None
   trace_tenant_id: str | None = None

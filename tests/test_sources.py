@@ -47,6 +47,7 @@ from app.core.exceptions import SourceNotFoundError
 from app.services import (
   incident_investigation_service,
   loki_service,
+  prometheus_service,
   trace_service,
 )
 from app.services.source_service import get_project_prometheus_source
@@ -590,6 +591,114 @@ async def test_prometheus_authenticated_source_requires_encryption_key(
   )
   assert response.status_code == 503
   assert "must-not-be-persisted" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_prometheus_connection_validation_is_owner_only_and_records_status(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  monkeypatch.setattr(settings, "PROMETHEUS_ALLOWED_HOSTS", "prometheus.test")
+  encryption_key = Fernet.generate_key().decode("ascii")
+  monkeypatch.setattr(
+    settings,
+    "PROMETHEUS_CREDENTIAL_ENCRYPTION_KEY",
+    SecretStr(encryption_key),
+  )
+  owner = await _create_user(session_factory, "prometheus-validation-owner")
+  member = await _create_user(session_factory, "prometheus-validation-member")
+  project_id = await _create_project(client, owner, "Prometheus validation project")
+  other_project_id = await _create_project(client, owner, "Other Prometheus project")
+  await _create_member(session_factory, project_id, member)
+  created = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Prometheus readiness",
+      "source_type": "prometheus",
+      "prometheus_url": "https://prometheus.test/prefix",
+      "prometheus_auth_type": "bearer",
+      "prometheus_bearer_token": "do-not-return-this-token",
+    },
+    headers=_headers(owner),
+  )
+  source_id = created.json()["id"]
+  real_async_client = httpx.AsyncClient
+  requests: list[httpx.Request] = []
+
+  def ready_handler(request: httpx.Request) -> httpx.Response:
+    requests.append(request)
+    return httpx.Response(200, text="Prometheus Server is Ready")
+
+  monkeypatch.setattr(
+    prometheus_service.httpx,
+    "AsyncClient",
+    lambda *args, **kwargs: real_async_client(
+      transport=httpx.MockTransport(ready_handler),
+      *args,
+      **kwargs,
+    ),
+  )
+  validated = await client.post(
+    f"/projects/{project_id}/sources/{source_id}/prometheus/validate",
+    headers=_headers(owner),
+  )
+  member_validation = await client.post(
+    f"/projects/{project_id}/sources/{source_id}/prometheus/validate",
+    headers=_headers(member),
+  )
+  cross_project_validation = await client.post(
+    f"/projects/{other_project_id}/sources/{source_id}/prometheus/validate",
+    headers=_headers(owner),
+  )
+
+  assert created.status_code == 201
+  assert validated.status_code == 200
+  assert validated.json()["prometheus_connection_status"] == "connected"
+  assert validated.json()["prometheus_last_checked_at"] is not None
+  assert "do-not-return-this-token" not in validated.text
+  assert requests[0].url.path == "/prefix/-/ready"
+  assert requests[0].headers["Authorization"] == (
+    "Bearer do-not-return-this-token"
+  )
+  assert member_validation.status_code == 403
+  assert cross_project_validation.status_code == 404
+
+  monkeypatch.setattr(
+    prometheus_service.httpx,
+    "AsyncClient",
+    lambda *args, **kwargs: real_async_client(
+      transport=httpx.MockTransport(
+        lambda _request: httpx.Response(401, text="secret upstream response"),
+      ),
+      *args,
+      **kwargs,
+    ),
+  )
+  rejected = await client.post(
+    f"/projects/{project_id}/sources/{source_id}/prometheus/validate",
+    headers=_headers(owner),
+  )
+  listed = await client.get(
+    f"/projects/{project_id}/sources",
+    headers=_headers(owner),
+  )
+  assert rejected.status_code == 502
+  assert "secret upstream response" not in rejected.text
+  assert listed.json()[0]["prometheus_connection_status"] == "unavailable"
+  assert listed.json()[0]["prometheus_last_checked_at"] is not None
+
+  reset = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}/prometheus",
+    json={
+      "prometheus_url": "https://prometheus.test/prefix",
+      "prometheus_auth_type": "none",
+    },
+    headers=_headers(owner),
+  )
+  assert reset.status_code == 200
+  assert reset.json()["prometheus_connection_status"] == "not_checked"
+  assert reset.json()["prometheus_last_checked_at"] is None
 
 
 @pytest.mark.asyncio

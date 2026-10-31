@@ -37,6 +37,7 @@ from app.schemas.source_schema import (
   SourceEventDetailResponse,
   SourceEventResponse,
   SourceResponse,
+  SourcePatchRequest,
   LokiSourceConfigurationRequest,
   PrometheusSourceConfigurationRequest,
   TraceSourceConfigurationRequest,
@@ -47,7 +48,9 @@ from app.services.loki_service import automatically_retrieve_loki_logs
 from app.services.source_service import (
   authenticate_source,
   create_source,
+  delete_source,
   disable_source,
+  get_project_source,
   get_project_event,
   list_project_events,
   list_sources,
@@ -56,6 +59,7 @@ from app.services.source_service import (
   update_trace_source,
   update_loki_source,
   update_prometheus_source,
+  update_source,
   validate_prometheus_source_connection,
   validate_trace_source_connection,
 )
@@ -375,6 +379,91 @@ async def list_project_sources(
   except (ProjectNotFoundError, PermissionDeniedError) as error:
     raise _raise_project_access_error(error) from error
   return [_source_response(source) for source in sources]
+
+
+@router.get(
+  "/projects/{project_id}/sources/{source_id}",
+  response_model=SourceResponse,
+)
+async def get_project_source_detail(
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> SourceResponse:
+  try:
+    source = await get_project_source(session, project_id, source_id, user)
+  except (ProjectNotFoundError, PermissionDeniedError) as error:
+    raise _raise_project_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  return _source_response(source)
+
+
+@router.patch(
+  "/projects/{project_id}/sources/{source_id}",
+  response_model=SourceResponse,
+)
+async def patch_project_source(
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  request: SourcePatchRequest,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> SourceResponse:
+  try:
+    source = await update_source(
+      session,
+      project_id,
+      source_id,
+      user,
+      request,
+    )
+  except (ProjectNotFoundError, PermissionDeniedError) as error:
+    raise _raise_project_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  except SourceConflictError as error:
+    raise HTTPException(status_code=409, detail=str(error)) from error
+  except SourceConfigurationError as error:
+    raise HTTPException(status_code=422, detail=str(error)) from error
+  except LokiIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
+  except PrometheusIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
+  except TraceIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
+  return _source_response(source)
+
+
+@router.delete(
+  "/projects/{project_id}/sources/{source_id}",
+  status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_project_source(
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> Response:
+  try:
+    await delete_source(session, project_id, source_id, user)
+  except (ProjectNotFoundError, PermissionDeniedError) as error:
+    raise _raise_project_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  except SourceConflictError as error:
+    raise HTTPException(status_code=409, detail=str(error)) from error
+  return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(

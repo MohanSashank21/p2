@@ -358,6 +358,97 @@ class TraceSourceConfigurationRequest(BaseModel):
     return self
 
 
+class SourcePatchRequest(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  name: str | None = Field(default=None, min_length=1, max_length=120)
+  enabled: bool | None = None
+  environment_id: uuid.UUID | None = None
+  loki_url: AnyHttpUrl | None = None
+  loki_tenant_id: str | None = Field(default=None, max_length=255)
+  loki_auth_type: Literal["none", "bearer", "basic"] | None = None
+  loki_username: str | None = Field(default=None, max_length=255)
+  loki_password: SecretStr | None = None
+  loki_bearer_token: SecretStr | None = None
+  prometheus_url: AnyHttpUrl | None = None
+  prometheus_auth_type: Literal["none", "bearer", "basic"] | None = None
+  prometheus_username: str | None = Field(default=None, max_length=255)
+  prometheus_password: SecretStr | None = None
+  prometheus_bearer_token: SecretStr | None = None
+  trace_backend: Literal["tempo"] | None = None
+  trace_url: AnyHttpUrl | None = None
+  trace_tenant_id: str | None = Field(default=None, max_length=255)
+  trace_auth_type: Literal["none", "bearer", "basic"] | None = None
+  trace_username: str | None = Field(default=None, max_length=255)
+  trace_password: SecretStr | None = None
+  trace_bearer_token: SecretStr | None = None
+  trace_service_name: str | None = Field(default=None, max_length=255)
+  trace_resource_attributes: dict[str, str] | None = None
+
+  @field_validator("name")
+  @classmethod
+  def validate_patch_name(cls, name: str | None) -> str | None:
+    if name is None:
+      return name
+    name = name.strip()
+    if not name:
+      raise ValueError("Source name cannot be blank")
+    return name
+
+  @model_validator(mode="after")
+  def validate_patch(self) -> Self:
+    fields_set = self.model_fields_set
+    if not fields_set:
+      raise ValueError("At least one source field must be provided")
+    for field in (
+      "name",
+      "enabled",
+      "environment_id",
+      "loki_url",
+      "loki_auth_type",
+      "loki_username",
+      "loki_password",
+      "loki_bearer_token",
+      "prometheus_url",
+      "prometheus_auth_type",
+      "prometheus_username",
+      "prometheus_password",
+      "prometheus_bearer_token",
+      "trace_backend",
+      "trace_url",
+      "trace_auth_type",
+      "trace_username",
+      "trace_password",
+      "trace_bearer_token",
+      "trace_resource_attributes",
+    ):
+      if (
+        field in fields_set
+        and getattr(self, field) is None
+        and field != "environment_id"
+      ):
+        raise ValueError(f"{field} cannot be null")
+    for prefix in ("loki", "prometheus", "trace"):
+      auth_type = f"{prefix}_auth_type"
+      credential_fields = (
+        f"{prefix}_username",
+        f"{prefix}_password",
+        f"{prefix}_bearer_token",
+      )
+      if any(field in fields_set for field in credential_fields):
+        if auth_type not in fields_set or getattr(self, auth_type) is None:
+          raise ValueError(
+            f"{auth_type} is required when changing credentials",
+          )
+        _validate_prometheus_auth(
+          getattr(self, auth_type),
+          getattr(self, credential_fields[0]),
+          getattr(self, credential_fields[1]),
+          getattr(self, credential_fields[2]),
+        )
+    return self
+
+
 class TraceQueryRequest(BaseModel):
   source_id: uuid.UUID
   trace_id: str | None = Field(default=None, min_length=16, max_length=32)

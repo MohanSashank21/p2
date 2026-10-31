@@ -455,11 +455,15 @@ reopens the same incident.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /projects/{project_id}/sources` | Create a generic webhook, Alertmanager, Grafana, Loki, or Tempo trace source; owner only. |
+| `POST /projects/{project_id}/sources` | Create a generic webhook, Alertmanager, Grafana, Loki, Prometheus, Tempo trace, or Docker source; owner only. |
 | `GET /projects/{project_id}/sources` | List source metadata; project members only. |
+| `GET /projects/{project_id}/sources/{source_id}` | Retrieve one source within the project; project members only. |
+| `PATCH /projects/{project_id}/sources/{source_id}` | Partially update source name, environment, enabled state, or its provider configuration; owner only. Omitted fields are preserved. Set a provider's `*_auth_type` to `none` to clear its stored credentials. |
+| `DELETE /projects/{project_id}/sources/{source_id}` | Delete an unused source; owner only. Sources with event, alert, or evidence history cannot be deleted and should be disabled instead. |
 | `POST /projects/{project_id}/sources/{source_id}/rotate-credential` | Rotate the source secret; owner only. |
 | `POST /projects/{project_id}/sources/{source_id}/disable` | Disable webhook intake; owner only. |
 | `PATCH /projects/{project_id}/sources/{source_id}/loki` | Update Loki URL, tenant, authentication, or enabled state; owner only. Responses never include Loki credentials. |
+| `PATCH /projects/{project_id}/sources/{source_id}/prometheus` | Update Prometheus URL, authentication, or enabled state; owner only. Responses never include Prometheus credentials. |
 | `PATCH /projects/{project_id}/sources/{source_id}/traces` | Configure a Tempo query endpoint, tenant, authentication, service, and resource attributes; owner only. Responses never include credentials. |
 | `POST /projects/{project_id}/sources/{source_id}/traces/validate` | Check the Tempo query API connection and record its status; owner only. |
 | `POST /webhooks/sources/{source_id}` | Receive a generic event using the source's bearer credential; creates an incident. |

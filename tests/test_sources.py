@@ -347,6 +347,160 @@ async def test_source_creation_returns_one_time_credential_and_is_project_scoped
 
 
 @pytest.mark.asyncio
+async def test_source_lifecycle_get_patch_enable_and_safe_delete(source_client):
+  client, session_factory, _redis = source_client
+  owner = await _create_user(session_factory, "lifecycle-owner")
+  member = await _create_user(session_factory, "lifecycle-member")
+  outsider = await _create_user(session_factory, "lifecycle-outsider")
+  project_id = await _create_project(client, owner, "Source lifecycle")
+  other_project_id = await _create_project(client, owner, "Other source project")
+  await _create_member(session_factory, project_id, member)
+
+  created = await _create_source(client, project_id, owner)
+  source_id = created.json()["id"]
+  detail = await client.get(
+    f"/projects/{project_id}/sources/{source_id}",
+    headers=_headers(member),
+  )
+  hidden = await client.get(
+    f"/projects/{project_id}/sources/{source_id}",
+    headers=_headers(outsider),
+  )
+  cross_project = await client.get(
+    f"/projects/{other_project_id}/sources/{source_id}",
+    headers=_headers(owner),
+  )
+  member_patch = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"name": "Member cannot rename"},
+    headers=_headers(member),
+  )
+  member_delete = await client.delete(
+    f"/projects/{project_id}/sources/{source_id}",
+    headers=_headers(member),
+  )
+  disabled = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"enabled": False},
+    headers=_headers(owner),
+  )
+  enabled = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"enabled": True},
+    headers=_headers(owner),
+  )
+  renamed = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"name": "Renamed source"},
+    headers=_headers(owner),
+  )
+  unsupported_field = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"source_type": "docker"},
+    headers=_headers(owner),
+  )
+
+  assert created.status_code == 201
+  assert detail.status_code == 200
+  assert detail.json()["id"] == source_id
+  assert "credential" not in detail.json()
+  assert hidden.status_code == 404
+  assert cross_project.status_code == 404
+  assert member_patch.status_code == 403
+  assert member_delete.status_code == 403
+  assert disabled.status_code == 200
+  assert disabled.json()["enabled"] is False
+  assert enabled.status_code == 200
+  assert enabled.json()["enabled"] is True
+  assert renamed.status_code == 200
+  assert renamed.json()["name"] == "Renamed source"
+  assert unsupported_field.status_code == 422
+
+  duplicate = await _create_source(
+    client,
+    project_id,
+    owner,
+    name="Existing source",
+  )
+  conflict = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"name": "Existing source"},
+    headers=_headers(owner),
+  )
+  unused_delete = await client.delete(
+    f"/projects/{project_id}/sources/{duplicate.json()['id']}",
+    headers=_headers(owner),
+  )
+  after_delete = await client.get(
+    f"/projects/{project_id}/sources/{duplicate.json()['id']}",
+    headers=_headers(owner),
+  )
+  assert duplicate.status_code == 201
+  assert conflict.status_code == 409
+  assert unused_delete.status_code == 204
+  assert after_delete.status_code == 404
+
+  evidence_source = await _create_source(
+    client,
+    project_id,
+    owner,
+    name="Evidence source",
+  )
+  incident = await client.post(
+    f"/projects/{project_id}/incidents",
+    json={"incident_type": "manual", "title": "Evidence-linked incident"},
+    headers=_headers(owner),
+  )
+  async with session_factory() as session:
+    session.add(
+      IncidentEvidence(
+        incident_id=uuid.UUID(incident.json()["id"]),
+        incident_source_id=uuid.UUID(evidence_source.json()["id"]),
+        evidence_type="loki_logs",
+        original_content={},
+        normalized_content={},
+      ),
+    )
+    await session.commit()
+  evidence_delete = await client.delete(
+    f"/projects/{project_id}/sources/{evidence_source.json()['id']}",
+    headers=_headers(owner),
+  )
+  assert incident.status_code == 201
+  assert evidence_delete.status_code == 409
+
+  received = await client.post(
+    f"/webhooks/sources/{source_id}",
+    json={"title": "Source history"},
+    headers={"Authorization": f"Bearer {created.json()['credential']}"},
+  )
+  blocked_delete = await client.delete(
+    f"/projects/{project_id}/sources/{source_id}",
+    headers=_headers(owner),
+  )
+  assert received.status_code == 201
+  assert blocked_delete.status_code == 409
+  assert "disable it instead" in blocked_delete.json()["detail"]
+  async with session_factory() as session:
+    source = await session.get(IncidentSource, uuid.UUID(source_id))
+    events = list(
+      await session.scalars(
+        select(SourceEvent).where(SourceEvent.source_id == uuid.UUID(source_id)),
+      ),
+    )
+    evidence = list(
+      await session.scalars(
+        select(IncidentEvidence).where(
+          IncidentEvidence.source_event_id == events[0].id,
+        ),
+      ),
+    )
+  assert source is not None
+  assert len(events) == 1
+  assert len(evidence) == 1
+
+
+@pytest.mark.asyncio
 async def test_source_environment_must_belong_to_selected_project(source_client):
   client, session_factory, _redis = source_client
   owner = await _create_user(session_factory, "owner")
@@ -525,6 +679,35 @@ async def test_prometheus_credentials_are_encrypted_and_never_returned(
     headers=_headers(owner),
   )
   source_id = created.json()["id"]
+  async with session_factory() as session:
+    created_source = await session.get(IncidentSource, uuid.UUID(source_id))
+    assert created_source is not None
+    original_ciphertext = created_source.prometheus_auth_ciphertext
+  partial_update = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={
+      "name": "Renamed authenticated source",
+      "prometheus_url": "https://prometheus.test/metrics",
+    },
+    headers=_headers(owner),
+  )
+  async with session_factory() as session:
+    after_partial_update = await session.get(
+      IncidentSource,
+      uuid.UUID(source_id),
+    )
+    assert after_partial_update is not None
+    assert after_partial_update.prometheus_auth_ciphertext == original_ciphertext
+  cleared_credentials = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"prometheus_auth_type": "none"},
+    headers=_headers(owner),
+  )
+  incomplete_auth_switch = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"prometheus_auth_type": "basic"},
+    headers=_headers(owner),
+  )
   updated = await client.patch(
     f"/projects/{project_id}/sources/{source_id}/prometheus",
     json={
@@ -544,6 +727,16 @@ async def test_prometheus_credentials_are_encrypted_and_never_returned(
   assert created.json()["prometheus_auth_type"] == "bearer"
   assert created.json()["prometheus_auth_configured"] is True
   assert "do-not-return-this-token" not in created.text
+  assert partial_update.status_code == 200
+  assert partial_update.json()["name"] == "Renamed authenticated source"
+  assert partial_update.json()["prometheus_url"] == (
+    "https://prometheus.test/metrics"
+  )
+  assert partial_update.json()["prometheus_auth_configured"] is True
+  assert cleared_credentials.status_code == 200
+  assert cleared_credentials.json()["prometheus_auth_type"] == "none"
+  assert cleared_credentials.json()["prometheus_auth_configured"] is False
+  assert incomplete_auth_switch.status_code == 422
   assert updated.status_code == 200
   assert updated.json()["prometheus_auth_type"] == "basic"
   assert updated.json()["prometheus_auth_configured"] is True
@@ -1205,6 +1398,11 @@ async def test_loki_source_configuration_encrypts_credentials_and_is_owner_only(
     headers=_headers(owner),
   )
   source_id = created.json()["id"]
+  partial_update = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"loki_tenant_id": "tenant-partial"},
+    headers=_headers(owner),
+  )
   updated = await client.patch(
     f"/projects/{project_id}/sources/{source_id}/loki",
     json={
@@ -1231,6 +1429,9 @@ async def test_loki_source_configuration_encrypts_credentials_and_is_owner_only(
   )
 
   assert created.status_code == 201
+  assert partial_update.status_code == 200
+  assert partial_update.json()["loki_tenant_id"] == "tenant-partial"
+  assert partial_update.json()["loki_auth_configured"] is True
   assert updated.status_code == 200
   assert denied.status_code == 403
   assert updated.json()["loki_tenant_id"] == "tenant-b"
@@ -1535,6 +1736,11 @@ async def test_tempo_source_configuration_is_encrypted_and_owner_only(
     headers=_headers(owner),
   )
   source_id = created.json()["id"]
+  partial_update = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}",
+    json={"trace_service_name": "checkout-api-updated"},
+    headers=_headers(owner),
+  )
   real_async_client = httpx.AsyncClient
   health_requests: list[httpx.Request] = []
 
@@ -1555,6 +1761,9 @@ async def test_tempo_source_configuration_is_encrypted_and_owner_only(
     f"/projects/{project_id}/sources/{source_id}/traces/validate",
     headers=_headers(owner),
   )
+  assert partial_update.status_code == 200
+  assert partial_update.json()["trace_service_name"] == "checkout-api-updated"
+  assert partial_update.json()["trace_auth_configured"] is True
   assert validated.status_code == 200
   assert validated.json()["trace_connection_status"] == "connected"
   assert health_requests[0].headers["Authorization"] == (

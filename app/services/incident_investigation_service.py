@@ -15,6 +15,7 @@ from app.core.exceptions import (
   GitHubIntegrationError,
   GitHubNotFoundError,
   LokiIntegrationError,
+  PrometheusIntegrationError,
   RateLimitExceededError,
   SourceConfigurationError,
   SourceNotFoundError,
@@ -25,6 +26,10 @@ from app.db.user import User
 from app.schemas.investigation_schema import (
   CombinedIncidentInvestigationRequest,
   IntegrationInvestigationResult,
+)
+from app.schemas.prometheus_schema import (
+  PrometheusInstantQueryRequest,
+  PrometheusRangeQueryRequest,
 )
 from app.services import github_project_service
 from app.services.docker_service import (
@@ -37,10 +42,19 @@ from app.services.loki_service import (
   persist_loki_evidence,
   query_loki,
 )
-from app.services.redis_service import rate_limit_loki_queries
+from app.services.prometheus_service import (
+  PrometheusConnection,
+  persist_prometheus_evidence,
+  query_prometheus,
+)
+from app.services.redis_service import (
+  rate_limit_loki_queries,
+  rate_limit_prometheus_queries,
+)
 from app.services.source_service import (
   get_project_docker_source,
   get_project_loki_source,
+  get_project_prometheus_source,
   get_project_trace_source,
 )
 from app.services.trace_service import TraceQuery, retrieve_incident_traces
@@ -51,8 +65,16 @@ def _failure(error: Exception) -> IntegrationInvestigationResult:
     detail = str(error)
   elif isinstance(error, (SourceNotFoundError, SourceConfigurationError)):
     detail = str(error)
-  elif isinstance(error, (TraceIntegrationError, LokiIntegrationError,
-                           DockerIntegrationError, GitHubIntegrationError)):
+  elif isinstance(
+    error,
+    (
+      TraceIntegrationError,
+      LokiIntegrationError,
+      PrometheusIntegrationError,
+      DockerIntegrationError,
+      GitHubIntegrationError,
+    ),
+  ):
     detail = error.detail
   elif isinstance(error, (GitHubConflictError, GitHubNotFoundError)):
     detail = str(error)
@@ -189,12 +211,59 @@ async def investigate_incident_integrations(
   results["prometheus"] = IntegrationInvestigationResult(
     status="not_configured",
     detail=(
-      "Prometheus metrics are available through the incident tool registry. "
-      "This combined endpoint does not execute or persist Prometheus queries "
-      "until M3 evidence integration; alert metadata is included when present "
-      "in Grafana or Alertmanager evidence."
+      "Provide a bounded Prometheus query to retrieve and persist metric evidence."
     ),
   )
+
+  if request.prometheus is not None:
+    try:
+      source = await get_project_prometheus_source(
+        session,
+        project_id,
+        request.prometheus.source_id,
+        user,
+      )
+      query = request.prometheus
+      if (
+        isinstance(query, PrometheusInstantQueryRequest)
+        and query.evaluation_time is None
+      ):
+        query = query.model_copy(
+          update={"evaluation_time": datetime.now(UTC)},
+        )
+      await rate_limit_prometheus_queries(redis, source.id)
+      connection = PrometheusConnection(
+        base_url=source.prometheus_url or "",
+        auth_type=source.prometheus_auth_type or "none",
+        auth_ciphertext=source.prometheus_auth_ciphertext,
+      )
+      source_id = source.id
+      await _rollback_and_refresh_user(session, user)
+      prometheus_result = await query_prometheus(connection, query)
+      evidence = await persist_prometheus_evidence(
+        session,
+        project_id,
+        incident_id,
+        source_id,
+        prometheus_result,
+      )
+      results["prometheus"] = IntegrationInvestigationResult(
+        status=prometheus_result.status,
+        evidence_id=evidence.id,
+        detail=(
+          "Prometheus returned partial metric data."
+          if prometheus_result.partial
+          else None
+        ),
+      )
+    except (
+      SourceNotFoundError,
+      SourceConfigurationError,
+      PrometheusIntegrationError,
+      RateLimitExceededError,
+    ) as error:
+      results["prometheus"] = _failure(error)
+      await _rollback_and_refresh_user(session, user)
 
   if request.traces is not None:
     try:
@@ -411,7 +480,11 @@ async def investigate_incident_integrations(
   requested = [
     result.status
     for name, result in results.items()
-    if name in {"traces", "loki", "docker", "github"}
+    if name in {"traces", "loki", "docker", "github", "prometheus"}
+    and (
+      name != "prometheus"
+      or request.prometheus is not None
+    )
   ]
   if all(status in {"success", "empty"} for status in requested):
     aggregate_status = "success"

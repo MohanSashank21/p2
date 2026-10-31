@@ -51,12 +51,12 @@ async def test_evidence_tool_returns_paginated_project_scoped_evidence(
   arguments = IncidentEvidenceCriteria(
     limit=2,
     offset=4,
-    evidence_types=["grafana_notification", "loki_logs"],
+    evidence_types=["grafana_notification", "prometheus_metrics"],
   )
   items = [
     _evidence(context, "grafana_notification"),
-    _evidence(context, "loki_logs"),
-    _evidence(context, "loki_logs"),
+    _evidence(context, "prometheus_metrics"),
+    _evidence(context, "prometheus_metrics"),
   ]
   read_evidence = AsyncMock(return_value=items)
   monkeypatch.setattr(
@@ -85,7 +85,7 @@ async def test_evidence_tool_returns_paginated_project_scoped_evidence(
   assert result.data["content_is_untrusted"] is True
   assert [item.evidence_type for item in result.evidence] == [
     "grafana_notification",
-    "loki_logs",
+    "prometheus_metrics",
   ]
   read_evidence.assert_awaited_once_with(
     context.session,
@@ -94,7 +94,7 @@ async def test_evidence_tool_returns_paginated_project_scoped_evidence(
     context.user,
     limit=3,
     offset=4,
-    evidence_types={"grafana_notification", "loki_logs"},
+    evidence_types={"grafana_notification", "prometheus_metrics"},
   )
 
 

@@ -4,6 +4,10 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.schemas.incident_schema import IncidentEvidenceResponse
+from app.schemas.prometheus_schema import (
+  PrometheusInstantQueryRequest,
+  PrometheusRangeQueryRequest,
+)
 from app.schemas.source_schema import LokiQueryRequest, TraceQueryRequest
 
 
@@ -35,10 +39,21 @@ class CombinedIncidentInvestigationRequest(BaseModel):
   loki: LokiQueryRequest | None = None
   docker: DockerInvestigationCriteria | None = None
   github: GitHubInvestigationCriteria | None = None
+  prometheus: (
+    PrometheusInstantQueryRequest | PrometheusRangeQueryRequest | None
+  ) = None
 
   @model_validator(mode="after")
   def require_an_integration(self) -> Self:
-    if not any((self.traces, self.loki, self.docker, self.github)):
+    if not any(
+      (
+        self.traces,
+        self.loki,
+        self.docker,
+        self.github,
+        self.prometheus,
+      )
+    ):
       raise ValueError("Request at least one integration to investigate")
     return self
 

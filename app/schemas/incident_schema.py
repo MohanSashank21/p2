@@ -62,6 +62,7 @@ class IncidentEvidenceResponse(BaseModel):
     "github_context",
     "trace_spans",
     "docker_investigation",
+    "prometheus_metrics",
   ]
   incident_source_id: uuid.UUID | None = None
   original_content: dict

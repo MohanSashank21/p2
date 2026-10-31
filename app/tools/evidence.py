@@ -19,8 +19,9 @@ class IncidentEvidenceCriteria(BaseModel):
       "github_context",
       "trace_spans",
       "docker_investigation",
+      "prometheus_metrics",
     ]
-  ] | None = Field(default=None, min_length=1, max_length=8)
+  ] | None = Field(default=None, min_length=1, max_length=9)
 
 
 def evidence_payload(evidence: IncidentEvidence) -> dict[str, Any]:

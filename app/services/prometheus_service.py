@@ -1,20 +1,30 @@
 import asyncio
 import errno
+import hashlib
 import ipaddress
 import json
 import math
 import socket
+import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from pydantic import SecretStr
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.exceptions import PrometheusIntegrationError
+from app.core.exceptions import (
+  PrometheusIntegrationError,
+  SourceConfigurationError,
+)
+from app.db.incident import Incident, IncidentEvidence
+from app.db.incident_source import IncidentSource
 from app.schemas.prometheus_schema import (
   PrometheusInstantQueryRequest,
   PrometheusQueryResult,
@@ -625,6 +635,149 @@ async def query_prometheus(
     partial=partial,
     truncated=limit_reached,
   )
+
+
+async def persist_prometheus_evidence(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  incident_id: uuid.UUID,
+  source_id: uuid.UUID,
+  result: PrometheusQueryResult,
+) -> IncidentEvidence:
+  source = await session.scalar(
+    select(IncidentSource)
+    .where(
+      IncidentSource.id == source_id,
+      IncidentSource.project_id == project_id,
+      IncidentSource.source_type == "prometheus",
+      IncidentSource.enabled.is_(True),
+    )
+    .with_for_update(),
+  )
+  incident = await session.scalar(
+    select(Incident).where(
+      Incident.id == incident_id,
+      Incident.project_id == project_id,
+    ),
+  )
+  if source is None or incident is None or source.prometheus_url is None:
+    raise SourceConfigurationError(
+      "Prometheus source or incident changed while retrieving metrics",
+    )
+  stored_source_id = source.id
+  stored_incident_id = incident.id
+  source_endpoint = source.prometheus_url
+
+  query_criteria: dict[str, Any] = {
+    "source_id": str(stored_source_id),
+    "query_type": result.query_type,
+    "expression": result.expression,
+    "timeout_seconds": result.timeout_seconds,
+    "series_limit": result.series_limit,
+  }
+  if result.query_type == "instant":
+    if result.evaluation_time is None:
+      raise PrometheusIntegrationError(
+        502,
+        "Prometheus instant query is missing its evaluation time",
+        code="unexpected_response",
+      )
+    query_criteria["evaluation_time"] = (
+      result.evaluation_time.astimezone(UTC).isoformat()
+    )
+  else:
+    if result.start is None or result.end is None or result.step_seconds is None:
+      raise PrometheusIntegrationError(
+        502,
+        "Prometheus range query is missing its time range",
+        code="unexpected_response",
+      )
+    query_criteria["time_range"] = {
+      "start": result.start.astimezone(UTC).isoformat(),
+      "end": result.end.astimezone(UTC).isoformat(),
+      "step_seconds": result.step_seconds,
+    }
+
+  query_hash = hashlib.sha256(
+    json.dumps(
+      query_criteria,
+      sort_keys=True,
+      separators=(",", ":"),
+    ).encode("utf-8"),
+  ).hexdigest()
+  retrieved_at = datetime.now(UTC)
+  original = {
+    "expression": result.expression,
+    "results": result.results,
+  }
+  normalized = {
+    "status": result.status,
+    "source": "prometheus",
+    "source_id": str(stored_source_id),
+    "source_endpoint": source_endpoint,
+    "project_id": str(project_id),
+    "incident_id": str(stored_incident_id),
+    "query": query_criteria,
+    "query_hash": query_hash,
+    "result_type": result.result_type,
+    "result_count": result.result_count,
+    "sample_count": result.sample_count,
+    "warnings": result.warnings,
+    "infos": result.infos,
+    "partial": result.partial,
+    "truncated": result.truncated,
+    "retrieved_at": retrieved_at.isoformat(),
+    "content_is_untrusted": True,
+  }
+  encoded = json.dumps(
+    {"original": original, "normalized": normalized},
+    separators=(",", ":"),
+  ).encode("utf-8")
+  if len(encoded) > settings.PROMETHEUS_MAX_RESPONSE_BYTES:
+    raise PrometheusIntegrationError(
+      502,
+      "Prometheus evidence exceeded the configured response-size limit",
+      code="response_too_large",
+    )
+
+  evidence = await session.scalar(
+    select(IncidentEvidence).where(
+      IncidentEvidence.incident_source_id == source.id,
+      IncidentEvidence.incident_id == stored_incident_id,
+      IncidentEvidence.query_hash == query_hash,
+    ),
+  )
+  if evidence is None:
+    evidence = IncidentEvidence(
+      incident_id=stored_incident_id,
+      incident_source_id=stored_source_id,
+      query_hash=query_hash,
+      evidence_type="prometheus_metrics",
+      original_content=original,
+      normalized_content=normalized,
+    )
+    session.add(evidence)
+  else:
+    evidence.original_content = original
+    evidence.normalized_content = normalized
+  try:
+    await session.commit()
+  except IntegrityError:
+    await session.rollback()
+    evidence = await session.scalar(
+      select(IncidentEvidence).where(
+        IncidentEvidence.incident_source_id == stored_source_id,
+        IncidentEvidence.incident_id == stored_incident_id,
+        IncidentEvidence.query_hash == query_hash,
+      ),
+    )
+    if evidence is None:
+      raise
+    evidence.original_content = original
+    evidence.normalized_content = normalized
+    await session.commit()
+  await session.refresh(evidence)
+  return evidence
 
 
 def _count_samples(result_type: str, results: list[dict[str, Any]]) -> int:

@@ -108,7 +108,8 @@ class IncidentEvidence(Base):
     CheckConstraint(
       "evidence_type IN ('manual_report', 'webhook_payload', "
       "'alertmanager_notification', 'grafana_notification', 'loki_logs', "
-      "'github_context', 'trace_spans', 'docker_investigation')",
+      "'github_context', 'trace_spans', 'docker_investigation', "
+      "'prometheus_metrics')",
       name="ck_incident_evidence_type",
     ),
     UniqueConstraint(

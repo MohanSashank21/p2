@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import secrets
+import socket
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -43,7 +44,14 @@ from app.db.redis import get_redis
 from app.db.user import User
 from app.main import app
 from app.core.config import settings
-from app.core.exceptions import SourceNotFoundError
+from app.core.exceptions import (
+  PrometheusIntegrationError,
+  SourceNotFoundError,
+)
+from app.schemas.prometheus_schema import (
+  PrometheusInstantQueryRequest,
+  PrometheusQueryResult,
+)
 from app.services import (
   incident_investigation_service,
   loki_service,
@@ -906,10 +914,18 @@ async def test_live_prometheus_instant_range_empty_and_invalid_queries(
   monkeypatch,
 ):
   client, session_factory, fake_redis = source_client
+  with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    unavailable_port = listener.getsockname()[1]
   monkeypatch.setattr(
     settings,
     "PROMETHEUS_ALLOWED_HOSTS",
-    "localhost:9091",
+    f"localhost:9091,127.0.0.1:{unavailable_port}",
+  )
+  monkeypatch.setattr(
+    settings,
+    "LOKI_ALLOWED_HOSTS",
+    "localhost:3100",
   )
   owner = await _create_user(session_factory, "live-prometheus-owner")
   project_id = await _create_project(client, owner, "Live Prometheus project")
@@ -931,17 +947,42 @@ async def test_live_prometheus_instant_range_empty_and_invalid_queries(
   assert validated.status_code == 200
   assert validated.json()["prometheus_connection_status"] == "connected"
 
+  loki_source_response = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Stubbed Loki for failure-isolation test",
+      "source_type": "loki",
+      "loki_url": "http://localhost:3100",
+    },
+    headers=_headers(owner),
+  )
+  assert loki_source_response.status_code == 201, loki_source_response.text
+  loki_source_id = loki_source_response.json()["id"]
+
   incident_response = await client.post(
     f"/projects/{project_id}/incidents",
     json={"incident_type": "manual", "title": "Live metric verification"},
     headers=_headers(owner),
   )
   assert incident_response.status_code == 201
+  incident_id = uuid.UUID(incident_response.json()["id"])
+  async with session_factory() as session:
+    session.add(
+      IncidentEvidence(
+        incident_id=incident_id,
+        evidence_type="grafana_notification",
+        original_content={},
+        normalized_content={
+          "labels": {"service": "api", "environment": "test"},
+        },
+      ),
+    )
+    await session.commit()
   context = ToolContext(
     session=session_factory(),
     redis=fake_redis,
     project_id=project_id,
-    incident_id=uuid.UUID(incident_response.json()["id"]),
+    incident_id=incident_id,
     user=owner,
   )
   registry = create_tool_registry()
@@ -1015,6 +1056,167 @@ async def test_live_prometheus_instant_range_empty_and_invalid_queries(
   assert excessive_range.error is not None
   assert excessive_range.error.code == "query_limit_exceeded"
 
+  investigation_url = (
+    f"/projects/{project_id}/incidents/{context.incident_id}/investigate"
+  )
+  investigation_payload = {
+    "prometheus": {
+      "source_id": source_id,
+      "expression": "up",
+      "start": (now - timedelta(minutes=1)).isoformat(),
+      "end": now.isoformat(),
+      "step_seconds": 15,
+    },
+  }
+  investigation = await client.post(
+    investigation_url,
+    headers=_headers(owner),
+    json=investigation_payload,
+  )
+  assert investigation.status_code == 200, investigation.text
+  investigation_result = investigation.json()
+  assert investigation_result["status"] in {"success", "partial"}
+  assert investigation_result["integrations"]["prometheus"]["status"] in {
+    "success",
+    "partial",
+  }
+  persisted = [
+    item
+    for item in investigation_result["evidence"]
+    if item["evidence_type"] == "prometheus_metrics"
+  ]
+  assert len(persisted) == 1
+  assert (
+    persisted[0]["normalized_content"]["query"]["expression"] == "up"
+  )
+  assert persisted[0]["normalized_content"]["retrieved_at"]
+
+  repeated_investigation = await client.post(
+    investigation_url,
+    headers=_headers(owner),
+    json=investigation_payload,
+  )
+  assert repeated_investigation.status_code == 200
+  repeated_evidence = [
+    item
+    for item in repeated_investigation.json()["evidence"]
+    if item["evidence_type"] == "prometheus_metrics"
+  ]
+  assert len(repeated_evidence) == 1
+  assert repeated_evidence[0]["id"] == persisted[0]["id"]
+  assert repeated_evidence[0]["normalized_content"]["sample_count"] > 0
+
+  empty_investigation_payload = {
+    "prometheus": {
+      "source_id": source_id,
+      "expression": "opspilot_metric_that_does_not_exist",
+      "start": (now - timedelta(minutes=1)).isoformat(),
+      "end": now.isoformat(),
+      "step_seconds": 15,
+    },
+  }
+  empty_investigation = await client.post(
+    investigation_url,
+    headers=_headers(owner),
+    json=empty_investigation_payload,
+  )
+  assert empty_investigation.status_code == 200, empty_investigation.text
+  empty_result = empty_investigation.json()
+  assert empty_result["status"] == "success"
+  assert empty_result["integrations"]["prometheus"]["status"] == "empty"
+  empty_evidence = [
+    item
+    for item in empty_result["evidence"]
+    if item["evidence_type"] == "prometheus_metrics"
+    and item["normalized_content"]["query"]["expression"]
+    == "opspilot_metric_that_does_not_exist"
+  ]
+  assert len(empty_evidence) == 1
+  assert empty_evidence[0]["normalized_content"]["status"] == "empty"
+  assert empty_evidence[0]["normalized_content"]["result_count"] == 0
+  assert empty_evidence[0]["normalized_content"]["sample_count"] == 0
+  assert empty_evidence[0]["original_content"]["results"] == []
+
+  unavailable_source = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Prometheus connection-refused test",
+      "source_type": "prometheus",
+      "prometheus_url": f"http://127.0.0.1:{unavailable_port}",
+    },
+    headers=_headers(owner),
+  )
+  assert unavailable_source.status_code == 201, unavailable_source.text
+  unavailable_source_id = unavailable_source.json()["id"]
+
+  async def query_stubbed_loki(_connection, query, start, end, _limit):
+    return loki_service.LokiQueryResult(
+      status="success",
+      entries=[
+        {
+          "timestamp": str(int(end.timestamp() * 1_000_000_000)),
+          "line": "stubbed log evidence",
+          "labels": {"service": "api", "environment": "test"},
+        },
+      ],
+      query=query,
+      query_hash="m3-live-outage-loki-query",
+      start=start,
+      end=end,
+      retrieved_at=datetime.now(UTC),
+    )
+
+  monkeypatch.setattr(
+    incident_investigation_service,
+    "query_loki",
+    query_stubbed_loki,
+  )
+  unavailable_expression = 'up{job="opspilot-missing-job"}'
+  unavailable_investigation = await client.post(
+    investigation_url,
+    headers=_headers(owner),
+    json={
+      "prometheus": {
+        "source_id": unavailable_source_id,
+        "expression": unavailable_expression,
+      },
+      "loki": {
+        "source_id": loki_source_id,
+        "start": (now - timedelta(minutes=1)).isoformat(),
+        "end": now.isoformat(),
+        "labels": {"service": "api", "environment": "test"},
+        "limit": 10,
+      },
+    },
+  )
+  assert unavailable_investigation.status_code == 200, (
+    unavailable_investigation.text
+  )
+  unavailable_result = unavailable_investigation.json()
+  assert unavailable_result["status"] == "partial"
+  assert (
+    unavailable_result["integrations"]["prometheus"]["status"]
+    == "unavailable"
+  )
+  unavailable_detail = unavailable_result["integrations"]["prometheus"]["detail"]
+  assert "refused" in unavailable_detail.lower()
+  assert (
+    unavailable_result["integrations"]["prometheus"]["evidence_id"]
+    is None
+  )
+  assert unavailable_result["integrations"]["loki"]["status"] == "success"
+  assert not any(
+    item["evidence_type"] == "prometheus_metrics"
+    and item["normalized_content"]["query"]["expression"]
+    == unavailable_expression
+    for item in unavailable_result["evidence"]
+  )
+  incident_state = await client.get(
+    f"/projects/{project_id}/incidents/{incident_id}",
+    headers=_headers(owner),
+  )
+  assert incident_state.status_code == 200
+  assert incident_state.json()["status"] == "open"
 
 @pytest.mark.asyncio
 async def test_webhook_persists_project_event_and_duplicate_delivery_is_idempotent(
@@ -2991,7 +3193,7 @@ async def test_combined_incident_investigation_collects_all_available_evidence(
   assert result["integrations"]["grafana"]["status"] == "included"
   assert result["integrations"]["prometheus"]["status"] == "not_configured"
   assert result["integrations"]["prometheus"]["detail"].startswith(
-    "Prometheus metrics are available through the incident tool registry.",
+    "Provide a bounded Prometheus query",
   )
   evidence_types = {item["evidence_type"] for item in result["evidence"]}
   assert {
@@ -3048,3 +3250,213 @@ async def test_combined_incident_investigation_collects_all_available_evidence(
     if item["evidence_type"] == "github_context"
   ]
   assert len(github_evidence) == 1
+
+
+@pytest.mark.asyncio
+async def test_combined_prometheus_investigation_persists_partial_evidence(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  owner = await _create_user(session_factory, "prometheus-evidence-owner")
+  project_id = await _create_project(
+    client,
+    owner,
+    "Prometheus evidence project",
+  )
+  incident = await _create_labeled_test_incident(session_factory, project_id)
+  source_id = uuid.uuid4()
+  async with session_factory() as session:
+    session.add(
+      IncidentSource(
+        id=source_id,
+        project_id=project_id,
+        name="Prometheus test",
+        source_type="prometheus",
+        prometheus_url="http://prometheus.test:9090",
+        prometheus_auth_type="none",
+        credential_hash="p" * 64,
+      ),
+    )
+    await session.commit()
+
+  start = datetime.now(UTC) - timedelta(minutes=5)
+  end = datetime.now(UTC)
+  query_result = PrometheusQueryResult(
+    status="partial",
+    query_type="range",
+    expression="pg_up",
+    start=start,
+    end=end,
+    step_seconds=15,
+    timeout_seconds=10,
+    series_limit=100,
+    result_type="matrix",
+    results=[
+      {
+        "metric": {"instance": "postgres-exporter:9187", "job": "postgres"},
+        "values": [[end.timestamp(), "1"]],
+      },
+    ],
+    result_count=1,
+    sample_count=1,
+    warnings=["Prometheus returned a partial response"],
+    partial=True,
+  )
+  queries = []
+
+  async def query_prometheus(connection, request):
+    assert connection.base_url == "http://prometheus.test:9090"
+    assert request.expression == "pg_up"
+    queries.append(request)
+    if isinstance(request, PrometheusInstantQueryRequest):
+      assert request.evaluation_time is not None
+      return PrometheusQueryResult(
+        status="success",
+        query_type="instant",
+        expression=request.expression,
+        evaluation_time=request.evaluation_time,
+        timeout_seconds=10,
+        series_limit=100,
+        result_type="vector",
+        results=[
+          {
+            "metric": {"instance": "postgres-exporter:9187", "job": "postgres"},
+            "value": [request.evaluation_time.timestamp(), "1"],
+          },
+        ],
+        result_count=1,
+        sample_count=1,
+      )
+    return query_result
+
+  monkeypatch.setattr(
+    incident_investigation_service,
+    "query_prometheus",
+    query_prometheus,
+  )
+  url = (
+    f"/projects/{project_id}/incidents/{incident.id}/investigate"
+  )
+  payload = {
+    "prometheus": {
+      "source_id": str(source_id),
+      "expression": "pg_up",
+      "start": start.isoformat(),
+      "end": end.isoformat(),
+      "step_seconds": 15,
+    },
+  }
+  response = await client.post(url, headers=_headers(owner), json=payload)
+
+  assert response.status_code == 200, response.text
+  body = response.json()
+  assert body["status"] == "partial"
+  assert body["integrations"]["prometheus"]["status"] == "partial"
+  evidence_id = body["integrations"]["prometheus"]["evidence_id"]
+  evidence = next(
+    item for item in body["evidence"]
+    if item["evidence_type"] == "prometheus_metrics"
+  )
+  assert evidence["id"] == evidence_id
+  assert evidence["original_content"]["expression"] == "pg_up"
+  assert evidence["original_content"]["results"][0]["metric"]["job"] == "postgres"
+  normalized = evidence["normalized_content"]
+  assert normalized["query"]["expression"] == "pg_up"
+  assert normalized["query"]["time_range"]["start"] == start.isoformat()
+  assert normalized["result_count"] == 1
+  assert normalized["partial"] is True
+  assert normalized["warnings"] == ["Prometheus returned a partial response"]
+  assert normalized["source_endpoint"] == "http://prometheus.test:9090"
+  assert normalized["retrieved_at"]
+  assert len(normalized["query_hash"]) == 64
+
+  repeated = await client.post(url, headers=_headers(owner), json=payload)
+  assert repeated.status_code == 200, repeated.text
+  repeated_evidence = [
+    item
+    for item in repeated.json()["evidence"]
+    if item["evidence_type"] == "prometheus_metrics"
+  ]
+  assert len(repeated_evidence) == 1
+  assert repeated_evidence[0]["id"] == evidence_id
+  assert len(queries) == 2
+
+  other_project_id = await _create_project(
+    client,
+    owner,
+    "Foreign Prometheus project",
+  )
+  foreign_source_id = uuid.uuid4()
+  async with session_factory() as session:
+    session.add(
+      IncidentSource(
+        id=foreign_source_id,
+        project_id=other_project_id,
+        name="Foreign Prometheus",
+        source_type="prometheus",
+        prometheus_url="http://foreign-prometheus.test:9090",
+        prometheus_auth_type="none",
+        credential_hash="f" * 64,
+      ),
+    )
+    await session.commit()
+  cross_project = await client.post(
+    url,
+    headers=_headers(owner),
+    json={
+      "prometheus": {
+        **payload["prometheus"],
+        "source_id": str(foreign_source_id),
+      },
+    },
+  )
+  assert cross_project.status_code == 200
+  assert (
+    cross_project.json()["integrations"]["prometheus"]["status"]
+    == "unavailable"
+  )
+  assert len(queries) == 2
+
+  instant = await client.post(
+    url,
+    headers=_headers(owner),
+    json={
+      "prometheus": {
+        "source_id": str(source_id),
+        "expression": "pg_up",
+      },
+    },
+  )
+  assert instant.status_code == 200, instant.text
+  instant_body = instant.json()
+  assert instant_body["integrations"]["prometheus"]["status"] == "success"
+  instant_evidence = next(
+    item
+    for item in instant_body["evidence"]
+    if item["evidence_type"] == "prometheus_metrics"
+    and item["normalized_content"]["query"]["query_type"] == "instant"
+  )
+  assert instant_evidence["normalized_content"]["query"]["evaluation_time"]
+  assert len(queries) == 3
+
+  async def unavailable_query(_connection, _request):
+    raise PrometheusIntegrationError(
+      502,
+      "Prometheus query timed out",
+      code="query_timeout",
+    )
+
+  monkeypatch.setattr(
+    incident_investigation_service,
+    "query_prometheus",
+    unavailable_query,
+  )
+  unavailable = await client.post(url, headers=_headers(owner), json=payload)
+  assert unavailable.status_code == 200, unavailable.text
+  assert unavailable.json()["integrations"]["prometheus"]["status"] == "unavailable"
+  assert len([
+    item
+    for item in unavailable.json()["evidence"]
+    if item["evidence_type"] == "prometheus_metrics"
+  ]) == 2

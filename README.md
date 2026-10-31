@@ -210,6 +210,13 @@ GitHub workflow:
   "github": {
     "repository_id": 123456789,
     "event_id": "FAILED_WORKFLOW_EVENT_UUID"
+  },
+  "prometheus": {
+    "source_id": "PROMETHEUS_SOURCE_UUID",
+    "expression": "pg_up",
+    "start": "2026-10-29T19:00:00Z",
+    "end": "2026-10-29T19:10:00Z",
+    "step_seconds": 15
   }
 }
 ```
@@ -220,18 +227,26 @@ explicit container ID, and GitHub investigations require a failed or
 unexpected workflow event. Every backend can return `success`, `empty`,
 `partial`, or `unavailable`; the aggregate response also returns the incident's
 persisted evidence.
+Prometheus can be requested with either an instant query (`source_id`,
+`expression`, and optional `evaluation_time`) or a range query (`source_id`,
+`expression`, `start`, `end`, and `step_seconds`). Its bounded result is saved
+as deduplicated `prometheus_metrics` incident evidence with query criteria,
+time metadata, labels/results, retrieval time, and source provenance. Empty and
+partial results are also persisted; failed or unavailable queries are not
+stored. Repeating the same effective query (including the evaluation time for
+instant queries) updates the same evidence record.
 
 Prometheus sources can store an endpoint and optional bearer/basic credentials.
 Set `PROMETHEUS_ALLOWED_HOSTS` to a comma-separated exact-host allowlist and,
 for authenticated sources, set and back up `PROMETHEUS_CREDENTIAL_ENCRYPTION_KEY`.
 Generate a Fernet key with the command shown in the Loki setup above.
 Credentials are encrypted at rest and source responses expose only the auth
-type and whether credentials are configured. Read-only PromQL queries are
-available to the incident tool registry as `prometheus.query_instant` and
-`prometheus.query_range`. The tools accept a source ID and PromQL, never a
-caller-supplied endpoint; source access is checked against the authorized
-incident project. M2 query results are not persisted as evidence; evidence
-integration is a separate milestone.
+type and whether credentials are configured. Read-only PromQL queries are available to the incident tool registry as
+`prometheus.query_instant` and `prometheus.query_range`; these tools return
+bounded results without persisting them. To persist query output with an
+incident, pass the `prometheus` criteria to the combined investigation endpoint.
+Both paths accept a source ID and PromQL, never a caller-supplied endpoint;
+source access is checked against the authorized incident project.
 
 Project owners can test the configured endpoint with
 `POST /projects/{project_id}/sources/{source_id}/prometheus/validate`. The

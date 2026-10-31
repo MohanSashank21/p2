@@ -114,6 +114,7 @@ async def test_github_tool_returns_workflow_context_as_untrusted_evidence(
   )
 
   assert result.status == "success"
+  assert result.content_is_untrusted is True
   assert result.completeness == "complete"
   assert result.truncated is False
   assert result.data == {

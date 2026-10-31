@@ -103,6 +103,7 @@ async def _investigate_github_workflow(
     ],
     completeness="partial" if is_partial else "complete",
     truncated=truncated,
+    content_is_untrusted=True,
   )
 
 
@@ -116,4 +117,5 @@ investigate_github_workflow_tool = ToolDefinition(
   input_model=GitHubInvestigationCriteria,
   handler=_investigate_github_workflow,
   read_only=True,
+  persists_evidence=True,
 )

@@ -83,6 +83,7 @@ async def _query_incident_traces(
     ],
     completeness="partial" if truncated else "complete",
     truncated=truncated,
+    content_is_untrusted=True,
   )
 
 
@@ -95,4 +96,5 @@ query_incident_traces_tool = ToolDefinition(
   input_model=TraceQueryRequest,
   handler=_query_incident_traces,
   read_only=True,
+  persists_evidence=True,
 )

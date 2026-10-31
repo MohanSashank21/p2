@@ -75,6 +75,7 @@ async def _query_incident_logs(
     ],
     completeness="partial" if truncated else "complete",
     truncated=truncated,
+    content_is_untrusted=True,
   )
 
 
@@ -87,4 +88,5 @@ query_incident_logs_tool = ToolDefinition(
   input_model=LokiQueryRequest,
   handler=_query_incident_logs,
   read_only=True,
+  persists_evidence=True,
 )

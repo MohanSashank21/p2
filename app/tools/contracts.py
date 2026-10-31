@@ -44,13 +44,25 @@ class ToolResult(BaseModel):
   collected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
   completeness: ToolCompleteness = "unknown"
   truncated: bool = False
+  content_is_untrusted: bool = Field(
+    default=False,
+    description="True when returned provider or persisted evidence content is untrusted input.",
+  )
 
 
 class ToolDescriptor(BaseModel):
   name: str
   description: str
   input_schema: dict[str, Any]
-  read_only: bool
+  read_only: bool = Field(
+    description=(
+      "True when the tool performs no provider-side mutations; it may still "
+      "persist evidence when persists_evidence is true."
+    ),
+  )
+  persists_evidence: bool = Field(
+    description="True when successful investigation results may be persisted as incident evidence.",
+  )
 
 
 class ToolNotFoundError(LookupError):
@@ -59,8 +71,11 @@ class ToolNotFoundError(LookupError):
 
 @dataclass(frozen=True, slots=True)
 class ToolDefinition(Generic[InputT]):
+  """An internal tool; read_only excludes provider mutations, not evidence writes."""
+
   name: str
   description: str
   input_model: type[InputT]
   handler: Callable[[ToolContext, InputT], Awaitable[ToolResult]]
   read_only: bool = True
+  persists_evidence: bool = False

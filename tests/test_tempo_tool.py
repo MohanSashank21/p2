@@ -92,6 +92,7 @@ async def test_tempo_tool_returns_evidence_and_marks_search_limit_as_truncated(
   assert result.status == "partial"
   assert result.truncated is True
   assert result.completeness == "partial"
+  assert result.content_is_untrusted is True
   assert result.data is not None
   assert result.data["trace_count"] == 2
   assert result.data["span_count"] == 4

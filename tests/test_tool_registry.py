@@ -13,7 +13,7 @@ from app.tools.contracts import (
   ToolError,
   ToolResult,
 )
-from app.tools.registry import ToolRegistry
+from app.tools.registry import ToolRegistry, create_tool_registry
 
 
 class EchoArguments(BaseModel):
@@ -61,6 +61,7 @@ def test_registry_rejects_duplicate_names_and_lists_stably():
     "type": "integer",
   }
   assert registry.list_tools()[0].read_only is True
+  assert registry.list_tools()[0].persists_evidence is False
   with pytest.raises(ValueError, match="Duplicate tool name"):
     registry.register(_tool("test.alpha", handler))
   with pytest.raises(ValueError, match="Only read-only"):
@@ -73,6 +74,19 @@ def test_registry_rejects_duplicate_names_and_lists_stably():
         read_only=False,
       ),
     )
+
+
+def test_provider_tool_discovery_declares_evidence_persistence():
+  tools = {
+    tool.name: tool
+    for tool in create_tool_registry().list_tools()
+  }
+
+  assert tools["loki.query_incident_logs"].persists_evidence is True
+  assert tools["tempo.query_incident_traces"].persists_evidence is True
+  assert tools["docker.investigate_incident_container"].persists_evidence is True
+  assert tools["github.investigate_failed_workflow"].persists_evidence is True
+  assert tools["incident.read_evidence"].persists_evidence is False
 
 
 @pytest.mark.asyncio

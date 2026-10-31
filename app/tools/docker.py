@@ -98,6 +98,7 @@ async def _investigate_incident_container(
     ],
     completeness="partial" if status in {"partial", "unavailable"} else "complete",
     truncated=truncated,
+    content_is_untrusted=True,
   )
 
 
@@ -110,4 +111,5 @@ investigate_incident_container_tool = ToolDefinition(
   input_model=DockerInvestigationCriteria,
   handler=_investigate_incident_container,
   read_only=True,
+  persists_evidence=True,
 )

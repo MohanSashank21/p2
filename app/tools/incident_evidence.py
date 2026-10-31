@@ -51,6 +51,7 @@ async def _read_incident_evidence(
     ],
     completeness="partial" if has_more else "complete",
     truncated=has_more,
+    content_is_untrusted=True,
   )
 
 

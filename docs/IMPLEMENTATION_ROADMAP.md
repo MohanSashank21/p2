@@ -384,6 +384,25 @@ invalid arguments, authorization path, and generated SQL bounds. Existing
 incident routes/source tests pass. Focused evidence/incident/source result:
 36 passed, 1 skipped. Full suite: 90 passed, 1 skipped.
 
+### Stage 1.6 — Tool trust and persistence metadata
+
+**Status:** Implemented; awaiting review.
+
+**Objective:** Make tool results consistently identify untrusted content, and
+make discovery distinguish provider-side read-only behavior from persisted
+incident-evidence side effects.
+
+**Implemented:** `ToolResult.content_is_untrusted` provides a top-level trust
+marker. Provider investigation tools set `ToolDefinition.persists_evidence`,
+which is exposed in `ToolDescriptor`; the incident evidence reader correctly
+does not claim to persist records. `read_only` is documented as excluding
+provider mutations while allowing separately declared evidence persistence.
+Existing result data and public API contracts remain unchanged.
+
+**Verification:** Focused registry and adapter tests: 20 passed. Full suite:
+95 passed, 1 skipped; the skipped PostgreSQL row-lock concurrency test still
+requires PostgreSQL. No live integrations were contacted.
+
 ### M1 — Direct Prometheus source configuration and validation
 
 **Status:** In progress; M1.1 and M1.2 implemented and awaiting review.

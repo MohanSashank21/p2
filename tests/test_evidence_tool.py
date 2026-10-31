@@ -77,6 +77,7 @@ async def test_evidence_tool_returns_paginated_project_scoped_evidence(
   assert result.status == "partial"
   assert result.truncated is True
   assert result.completeness == "partial"
+  assert result.content_is_untrusted is True
   assert result.data is not None
   assert result.data["returned_count"] == 2
   assert result.data["has_more"] is True

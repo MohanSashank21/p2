@@ -99,6 +99,7 @@ async def test_loki_tool_returns_evidence_and_marks_limit_as_truncated(
   assert result.status == "partial"
   assert result.truncated is True
   assert result.completeness == "partial"
+  assert result.content_is_untrusted is True
   assert result.data is not None
   assert result.data["entry_count"] == 1
   assert result.data["evidence"]["id"] == str(evidence_id)

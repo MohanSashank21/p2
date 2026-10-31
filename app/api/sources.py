@@ -11,6 +11,7 @@ from app.api.dependencies import get_current_user
 from app.core.exceptions import (
   PermissionDeniedError,
   LokiIntegrationError,
+  PrometheusIntegrationError,
   ProjectNotFoundError,
   RateLimitExceededError,
   SourceConflictError,
@@ -37,6 +38,7 @@ from app.schemas.source_schema import (
   SourceEventResponse,
   SourceResponse,
   LokiSourceConfigurationRequest,
+  PrometheusSourceConfigurationRequest,
   TraceSourceConfigurationRequest,
 )
 from app.services.redis_service import rate_limit_source_events
@@ -53,6 +55,7 @@ from app.services.source_service import (
   rotate_source_credential,
   update_trace_source,
   update_loki_source,
+  update_prometheus_source,
   validate_trace_source_connection,
 )
 
@@ -103,6 +106,9 @@ def _source_response(source: IncidentSource) -> SourceResponse:
     loki_tenant_id=source.loki_tenant_id,
     loki_auth_type=source.loki_auth_type,
     loki_auth_configured=source.loki_auth_ciphertext is not None,
+    prometheus_url=source.prometheus_url,
+    prometheus_auth_type=source.prometheus_auth_type,
+    prometheus_auth_configured=source.prometheus_auth_ciphertext is not None,
     trace_backend=source.trace_backend,
     trace_url=source.trace_url,
     trace_tenant_id=source.trace_tenant_id,
@@ -339,6 +345,11 @@ async def create_project_source(
       status_code=error.status_code,
       detail=error.detail,
     ) from error
+  except PrometheusIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
   except TraceIntegrationError as error:
     raise HTTPException(
       status_code=error.status_code,
@@ -430,6 +441,37 @@ async def configure_loki_source(
   except SourceNotFoundError as error:
     raise HTTPException(status_code=404, detail=str(error)) from error
   except LokiIntegrationError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail=error.detail,
+    ) from error
+  return _source_response(source)
+
+
+@router.patch(
+  "/projects/{project_id}/sources/{source_id}/prometheus",
+  response_model=SourceResponse,
+)
+async def configure_prometheus_source(
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  request: PrometheusSourceConfigurationRequest,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> SourceResponse:
+  try:
+    source = await update_prometheus_source(
+      session,
+      project_id,
+      source_id,
+      user,
+      request,
+    )
+  except (ProjectNotFoundError, PermissionDeniedError) as error:
+    raise _raise_project_access_error(error) from error
+  except SourceNotFoundError as error:
+    raise HTTPException(status_code=404, detail=str(error)) from error
+  except PrometheusIntegrationError as error:
     raise HTTPException(
       status_code=error.status_code,
       detail=error.detail,

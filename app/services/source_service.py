@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
   LokiIntegrationError,
+  PrometheusIntegrationError,
   PermissionDeniedError,
   SourceConfigurationError,
   TraceIntegrationError,
@@ -25,12 +26,17 @@ from app.db.user import User
 from app.schemas.source_schema import (
   IncomingSourceEvent,
   LokiSourceConfigurationRequest,
+  PrometheusSourceConfigurationRequest,
   SourceCreateRequest,
   TraceSourceConfigurationRequest,
 )
 from app.services.incident_service import create_webhook_incident
 from app.services.loki_service import encrypt_loki_auth, validate_loki_url
 from app.services.project_service import get_accessible_project
+from app.services.prometheus_service import (
+  encrypt_prometheus_auth,
+  validate_prometheus_url,
+)
 from app.services.trace_service import (
   TempoConnection,
   encrypt_trace_auth,
@@ -65,6 +71,8 @@ async def create_source(
 
   loki_url = None
   loki_auth_ciphertext = None
+  prometheus_url = None
+  prometheus_auth_ciphertext = None
   trace_url = None
   trace_auth_ciphertext = None
   if request.source_type == "loki":
@@ -89,6 +97,20 @@ async def create_source(
       request.trace_password,
       request.trace_bearer_token,
     )
+  if request.source_type == "prometheus":
+    if request.prometheus_url is None:
+      raise PrometheusIntegrationError(
+        422,
+        "prometheus_url is required for Prometheus sources",
+      )
+    validate_prometheus_url(str(request.prometheus_url))
+    prometheus_url = str(request.prometheus_url).rstrip("/")
+    prometheus_auth_ciphertext = encrypt_prometheus_auth(
+      request.prometheus_auth_type,
+      request.prometheus_username,
+      request.prometheus_password,
+      request.prometheus_bearer_token,
+    )
 
   credential = secrets.token_urlsafe(32)
   source = IncidentSource(
@@ -102,6 +124,11 @@ async def create_source(
       request.loki_auth_type if request.source_type == "loki" else None
     ),
     loki_auth_ciphertext=loki_auth_ciphertext,
+    prometheus_url=prometheus_url,
+    prometheus_auth_type=(
+      request.prometheus_auth_type if request.source_type == "prometheus" else None
+    ),
+    prometheus_auth_ciphertext=prometheus_auth_ciphertext,
     trace_backend=request.trace_backend if request.source_type == "traces" else None,
     trace_url=trace_url,
     trace_tenant_id=(
@@ -130,6 +157,32 @@ async def create_source(
     ) from error
   await session.refresh(source)
   return source, credential
+
+
+async def update_prometheus_source(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+  request: PrometheusSourceConfigurationRequest,
+) -> IncidentSource:
+  source = await _get_managed_source(session, project_id, source_id, user)
+  if source.source_type != "prometheus":
+    raise SourceNotFoundError("Prometheus source not found")
+  validate_prometheus_url(str(request.prometheus_url))
+  auth_ciphertext = encrypt_prometheus_auth(
+    request.prometheus_auth_type,
+    request.prometheus_username,
+    request.prometheus_password,
+    request.prometheus_bearer_token,
+  )
+  source.prometheus_url = str(request.prometheus_url).rstrip("/")
+  source.prometheus_auth_type = request.prometheus_auth_type
+  source.prometheus_auth_ciphertext = auth_ciphertext
+  source.enabled = request.enabled
+  await session.commit()
+  await session.refresh(source)
+  return source
 
 
 async def update_loki_source(
@@ -186,6 +239,29 @@ async def update_trace_source(
   source.enabled = request.enabled
   await session.commit()
   await session.refresh(source)
+  return source
+
+
+async def get_project_prometheus_source(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  source_id: uuid.UUID,
+  user: User,
+) -> IncidentSource:
+  await get_accessible_project(session, project_id, user)
+  source = await session.scalar(
+    select(IncidentSource).where(
+      IncidentSource.id == source_id,
+      IncidentSource.project_id == project_id,
+      IncidentSource.source_type == "prometheus",
+    ),
+  )
+  if source is None:
+    raise SourceNotFoundError("Prometheus source not found in this project")
+  if not source.enabled:
+    raise SourceConfigurationError("Prometheus source is disabled")
+  if source.prometheus_url is None:
+    raise SourceConfigurationError("Prometheus source is not configured")
   return source
 
 

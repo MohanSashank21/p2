@@ -43,7 +43,13 @@ from app.db.redis import get_redis
 from app.db.user import User
 from app.main import app
 from app.core.config import settings
-from app.services import incident_investigation_service, loki_service, trace_service
+from app.core.exceptions import SourceNotFoundError
+from app.services import (
+  incident_investigation_service,
+  loki_service,
+  trace_service,
+)
+from app.services.source_service import get_project_prometheus_source
 from app.utils.jwt import create_access_token
 
 
@@ -362,6 +368,228 @@ async def test_source_environment_must_belong_to_selected_project(source_client)
     environment_id=environment_id,
   )
   assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_prometheus_source_configuration_is_project_scoped_and_allowlisted(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  monkeypatch.setattr(settings, "PROMETHEUS_ALLOWED_HOSTS", "prometheus.test:9090")
+  owner = await _create_user(session_factory, "prometheus-owner")
+  member = await _create_user(session_factory, "prometheus-member")
+  project_id = await _create_project(client, owner, "Prometheus project")
+  other_project_id = await _create_project(client, owner, "Other Prometheus project")
+  await _create_member(session_factory, project_id, member)
+
+  created = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Production Prometheus",
+      "source_type": "prometheus",
+      "prometheus_url": "http://prometheus.test:9090",
+    },
+    headers=_headers(owner),
+  )
+  assert created.status_code == 201
+  assert created.json()["source_type"] == "prometheus"
+  assert created.json()["prometheus_url"] == "http://prometheus.test:9090"
+  assert "credential" in created.json()
+  source_id = uuid.UUID(created.json()["id"])
+
+  listed = await client.get(
+    f"/projects/{project_id}/sources",
+    headers=_headers(member),
+  )
+  member_update = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}/prometheus",
+    json={"prometheus_url": "https://prometheus.test:9090"},
+    headers=_headers(member),
+  )
+  cross_project_update = await client.patch(
+    f"/projects/{other_project_id}/sources/{source_id}/prometheus",
+    json={"prometheus_url": "https://prometheus.test:9090"},
+    headers=_headers(owner),
+  )
+  updated = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}/prometheus",
+    json={
+      "prometheus_url": "https://prometheus.test:9090/prometheus",
+    },
+    headers=_headers(owner),
+  )
+
+  assert listed.status_code == 200
+  assert listed.json()[0]["prometheus_url"] == "http://prometheus.test:9090"
+  assert member_update.status_code == 403
+  assert cross_project_update.status_code == 404
+  assert updated.status_code == 200
+  assert updated.json()["prometheus_url"] == (
+    "https://prometheus.test:9090/prometheus"
+  )
+  assert updated.json()["enabled"] is True
+  async with session_factory() as session:
+    source = await get_project_prometheus_source(
+      session,
+      project_id,
+      source_id,
+      member,
+    )
+    assert source.prometheus_url == "https://prometheus.test:9090/prometheus"
+    with pytest.raises(SourceNotFoundError):
+      await get_project_prometheus_source(
+        session,
+        other_project_id,
+        source_id,
+        owner,
+      )
+
+
+@pytest.mark.asyncio
+async def test_prometheus_source_rejects_untrusted_or_unconfigured_endpoints(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  monkeypatch.setattr(settings, "PROMETHEUS_ALLOWED_HOSTS", "prometheus.test:9090")
+  owner = await _create_user(session_factory, "prometheus-validation-owner")
+  project_id = await _create_project(client, owner, "Prometheus validation")
+  source_url = f"/projects/{project_id}/sources"
+
+  rejected_host = await client.post(
+    source_url,
+    json={
+      "name": "Untrusted Prometheus",
+      "source_type": "prometheus",
+      "prometheus_url": "http://other.test:9090",
+    },
+    headers=_headers(owner),
+  )
+  assert rejected_host.status_code == 422
+
+  for unsafe_url in (
+    "https://user:password@prometheus.test:9090",
+    "https://prometheus.test:9090/api?query=up",
+    "https://prometheus.test:9090/api#fragment",
+  ):
+    response = await client.post(
+      source_url,
+      json={
+        "name": "Unsafe Prometheus URL",
+        "source_type": "prometheus",
+        "prometheus_url": unsafe_url,
+      },
+      headers=_headers(owner),
+    )
+    assert response.status_code == 422
+
+  monkeypatch.setattr(settings, "PROMETHEUS_ALLOWED_HOSTS", "")
+  unconfigured_allowlist = await client.post(
+    source_url,
+    json={
+      "name": "Unconfigured Prometheus",
+      "source_type": "prometheus",
+      "prometheus_url": "https://prometheus.test:9090",
+    },
+    headers=_headers(owner),
+  )
+  assert unconfigured_allowlist.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_prometheus_credentials_are_encrypted_and_never_returned(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  monkeypatch.setattr(settings, "PROMETHEUS_ALLOWED_HOSTS", "prometheus.test")
+  encryption_key = Fernet.generate_key().decode("ascii")
+  monkeypatch.setattr(
+    settings,
+    "PROMETHEUS_CREDENTIAL_ENCRYPTION_KEY",
+    SecretStr(encryption_key),
+  )
+  owner = await _create_user(session_factory, "prometheus-auth-owner")
+  project_id = await _create_project(client, owner, "Prometheus auth project")
+  created = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Authenticated Prometheus",
+      "source_type": "prometheus",
+      "prometheus_url": "https://prometheus.test",
+      "prometheus_auth_type": "bearer",
+      "prometheus_bearer_token": "do-not-return-this-token",
+    },
+    headers=_headers(owner),
+  )
+  source_id = created.json()["id"]
+  updated = await client.patch(
+    f"/projects/{project_id}/sources/{source_id}/prometheus",
+    json={
+      "prometheus_url": "https://prometheus.test",
+      "prometheus_auth_type": "basic",
+      "prometheus_username": "prometheus-user",
+      "prometheus_password": "do-not-return-this-password",
+    },
+    headers=_headers(owner),
+  )
+  listed = await client.get(
+    f"/projects/{project_id}/sources",
+    headers=_headers(owner),
+  )
+
+  assert created.status_code == 201
+  assert created.json()["prometheus_auth_type"] == "bearer"
+  assert created.json()["prometheus_auth_configured"] is True
+  assert "do-not-return-this-token" not in created.text
+  assert updated.status_code == 200
+  assert updated.json()["prometheus_auth_type"] == "basic"
+  assert updated.json()["prometheus_auth_configured"] is True
+  assert "do-not-return-this-password" not in updated.text
+  assert "do-not-return-this-token" not in listed.text
+  async with session_factory() as session:
+    source = await session.get(IncidentSource, uuid.UUID(source_id))
+    assert source is not None
+    assert source.prometheus_auth_ciphertext is not None
+    assert source.prometheus_auth_ciphertext not in {
+      "do-not-return-this-token",
+      "do-not-return-this-password",
+    }
+    decrypted = json.loads(
+      Fernet(encryption_key.encode("ascii")).decrypt(
+        source.prometheus_auth_ciphertext.encode("ascii"),
+      ),
+    )
+  assert decrypted == {
+    "username": "prometheus-user",
+    "password": "do-not-return-this-password",
+  }
+
+
+@pytest.mark.asyncio
+async def test_prometheus_authenticated_source_requires_encryption_key(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, _redis = source_client
+  monkeypatch.setattr(settings, "PROMETHEUS_ALLOWED_HOSTS", "prometheus.test")
+  monkeypatch.setattr(settings, "PROMETHEUS_CREDENTIAL_ENCRYPTION_KEY", None)
+  owner = await _create_user(session_factory, "prometheus-no-key-owner")
+  project_id = await _create_project(client, owner, "Prometheus no key")
+  response = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "No encryption key",
+      "source_type": "prometheus",
+      "prometheus_url": "https://prometheus.test",
+      "prometheus_auth_type": "bearer",
+      "prometheus_bearer_token": "must-not-be-persisted",
+    },
+    headers=_headers(owner),
+  )
+  assert response.status_code == 503
+  assert "must-not-be-persisted" not in response.text
 
 
 @pytest.mark.asyncio

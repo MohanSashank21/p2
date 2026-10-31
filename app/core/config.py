@@ -14,6 +14,8 @@ class Settings(BaseSettings):
   LOKI_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
   LOKI_ALLOWED_HOSTS: str = ""
   LOKI_QUERY_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
+  PROMETHEUS_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
+  PROMETHEUS_ALLOWED_HOSTS: str = ""
   TRACE_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
   TRACE_ALLOWED_HOSTS: str = ""
   TRACE_QUERY_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)

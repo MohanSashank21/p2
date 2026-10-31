@@ -221,10 +221,15 @@ unexpected workflow event. Every backend can return `success`, `empty`,
 `partial`, or `unavailable`; the aggregate response also returns the incident's
 persisted evidence.
 
-Prometheus does not currently have a direct query integration. Prometheus
-alert metadata is available only when it was included in a Grafana or
-Alertmanager notification; this endpoint does not execute PromQL or fetch
-Prometheus time series.
+Prometheus sources can store an endpoint and optional bearer/basic credentials.
+Set `PROMETHEUS_ALLOWED_HOSTS` to a comma-separated exact-host allowlist and,
+for authenticated sources, set and back up `PROMETHEUS_CREDENTIAL_ENCRYPTION_KEY`.
+Generate a Fernet key with the command shown in the Loki setup above.
+Credentials are encrypted at rest and source responses expose only the auth
+type and whether credentials are configured. This configuration is not yet a
+direct query integration: Prometheus alert metadata is available only when
+included in a Grafana or Alertmanager notification; OpsPilot does not yet
+execute PromQL or fetch Prometheus time series.
 
 ### Instrument a FastAPI application
 

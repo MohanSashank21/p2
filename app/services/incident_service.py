@@ -204,13 +204,31 @@ async def list_incident_evidence(
   project_id: uuid.UUID,
   incident_id: uuid.UUID,
   user: User,
+  *,
+  limit: int | None = None,
+  offset: int = 0,
+  evidence_types: set[str] | None = None,
 ) -> list[IncidentEvidence]:
+  if limit is not None and limit < 1:
+    raise ValueError("Evidence limit must be positive")
+  if offset < 0:
+    raise ValueError("Evidence offset cannot be negative")
   await get_project_incident(session, project_id, incident_id, user)
-  result = await session.scalars(
+  statement = (
     select(IncidentEvidence)
     .where(IncidentEvidence.incident_id == incident_id)
-    .order_by(IncidentEvidence.created_at, IncidentEvidence.id),
   )
+  if evidence_types is not None:
+    statement = statement.where(IncidentEvidence.evidence_type.in_(evidence_types))
+  statement = statement.order_by(
+    IncidentEvidence.created_at,
+    IncidentEvidence.id,
+  )
+  if limit is not None:
+    statement = statement.limit(limit)
+  if offset:
+    statement = statement.offset(offset)
+  result = await session.scalars(statement)
   return list(result)
 
 

@@ -21,6 +21,7 @@ class SourceCreateRequest(BaseModel):
     "alertmanager",
     "grafana",
     "loki",
+    "prometheus",
     "traces",
     "docker",
   ] = "generic_webhook"
@@ -30,6 +31,11 @@ class SourceCreateRequest(BaseModel):
   loki_username: str | None = Field(default=None, max_length=255)
   loki_password: SecretStr | None = None
   loki_bearer_token: SecretStr | None = None
+  prometheus_url: AnyHttpUrl | None = None
+  prometheus_auth_type: Literal["none", "bearer", "basic"] = "none"
+  prometheus_username: str | None = Field(default=None, max_length=255)
+  prometheus_password: SecretStr | None = None
+  prometheus_bearer_token: SecretStr | None = None
   trace_backend: Literal["tempo"] | None = None
   trace_url: AnyHttpUrl | None = None
   trace_tenant_id: str | None = Field(default=None, max_length=255)
@@ -50,6 +56,26 @@ class SourceCreateRequest(BaseModel):
 
   @model_validator(mode="after")
   def validate_source_configuration(self) -> Self:
+    has_prometheus_config = any(
+      (
+        self.prometheus_url is not None,
+        self.prometheus_auth_type != "none",
+        self.prometheus_username is not None,
+        self.prometheus_password is not None,
+        self.prometheus_bearer_token is not None,
+      ),
+    )
+    if self.source_type != "prometheus" and has_prometheus_config:
+      raise ValueError("Prometheus settings are only valid for Prometheus sources")
+    if self.source_type == "prometheus":
+      _validate_prometheus_url(self.prometheus_url)
+      _validate_prometheus_auth(
+        self.prometheus_auth_type,
+        self.prometheus_username,
+        self.prometheus_password,
+        self.prometheus_bearer_token,
+      )
+
     has_trace_config = any(
       (
         self.trace_backend is not None,
@@ -101,6 +127,53 @@ class SourceCreateRequest(BaseModel):
       self.loki_bearer_token,
     )
     return self
+
+
+def _validate_prometheus_url(endpoint: AnyHttpUrl | None) -> None:
+  if endpoint is None:
+    raise ValueError("prometheus_url is required for Prometheus sources")
+  if (
+    endpoint.username is not None
+    or endpoint.password is not None
+    or endpoint.query is not None
+    or endpoint.fragment is not None
+    or "\\" in endpoint.path
+    or any(part in {".", ".."} for part in endpoint.path.split("/"))
+  ):
+    raise ValueError(
+      "Prometheus URL must not contain credentials, query, fragment, or dot segments",
+    )
+
+
+def _validate_prometheus_auth(
+  auth_type: Literal["none", "bearer", "basic"],
+  username: str | None,
+  password: SecretStr | None,
+  bearer_token: SecretStr | None,
+) -> None:
+  if auth_type == "none" and any((username, password, bearer_token)):
+    raise ValueError("Credentials are not allowed when prometheus_auth_type is none")
+  if auth_type == "bearer" and (
+    bearer_token is None
+    or not bearer_token.get_secret_value().strip()
+    or bearer_token.get_secret_value() != bearer_token.get_secret_value().strip()
+    or "\r" in bearer_token.get_secret_value()
+    or "\n" in bearer_token.get_secret_value()
+    or username is not None
+    or password is not None
+  ):
+    raise ValueError("Bearer auth requires only prometheus_bearer_token")
+  if auth_type == "basic" and (
+    username is None
+    or not username.strip()
+    or ":" in username
+    or "\r" in username
+    or "\n" in username
+    or password is None
+    or not password.get_secret_value()
+    or bearer_token is not None
+  ):
+    raise ValueError("Basic auth requires prometheus_username and prometheus_password")
 
 
 def _validate_loki_auth(
@@ -165,6 +238,26 @@ class LokiSourceConfigurationRequest(BaseModel):
       self.loki_username,
       self.loki_password,
       self.loki_bearer_token,
+    )
+    return self
+
+
+class PrometheusSourceConfigurationRequest(BaseModel):
+  prometheus_url: AnyHttpUrl
+  prometheus_auth_type: Literal["none", "bearer", "basic"] = "none"
+  prometheus_username: str | None = Field(default=None, max_length=255)
+  prometheus_password: SecretStr | None = None
+  prometheus_bearer_token: SecretStr | None = None
+  enabled: bool = True
+
+  @model_validator(mode="after")
+  def validate_prometheus_configuration(self) -> Self:
+    _validate_prometheus_url(self.prometheus_url)
+    _validate_prometheus_auth(
+      self.prometheus_auth_type,
+      self.prometheus_username,
+      self.prometheus_password,
+      self.prometheus_bearer_token,
     )
     return self
 
@@ -345,6 +438,9 @@ class SourceResponse(BaseModel):
   loki_tenant_id: str | None = None
   loki_auth_type: str | None = None
   loki_auth_configured: bool = False
+  prometheus_url: str | None = None
+  prometheus_auth_type: str | None = None
+  prometheus_auth_configured: bool = False
   trace_backend: str | None = None
   trace_url: str | None = None
   trace_tenant_id: str | None = None

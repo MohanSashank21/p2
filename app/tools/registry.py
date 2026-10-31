@@ -77,6 +77,10 @@ def create_tool_registry() -> ToolRegistry:
   from app.tools.github import investigate_github_workflow_tool
   from app.tools.incident_evidence import read_incident_evidence_tool
   from app.tools.loki import query_incident_logs_tool
+  from app.tools.prometheus import (
+    query_prometheus_instant_tool,
+    query_prometheus_range_tool,
+  )
   from app.tools.tempo import query_incident_traces_tool
 
   return ToolRegistry(
@@ -85,6 +89,8 @@ def create_tool_registry() -> ToolRegistry:
       investigate_github_workflow_tool,
       read_incident_evidence_tool,
       query_incident_logs_tool,
+      query_prometheus_instant_tool,
+      query_prometheus_range_tool,
       query_incident_traces_tool,
     ),
   )

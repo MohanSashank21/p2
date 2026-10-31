@@ -1,5 +1,5 @@
 from typing import Literal
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -17,6 +17,19 @@ class Settings(BaseSettings):
   PROMETHEUS_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
   PROMETHEUS_ALLOWED_HOSTS: str = ""
   PROMETHEUS_QUERY_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
+  PROMETHEUS_CONNECT_TIMEOUT_SECONDS: int = Field(default=3, ge=1, le=15)
+  PROMETHEUS_READ_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=60)
+  PROMETHEUS_TOTAL_TIMEOUT_SECONDS: int = Field(default=20, ge=1, le=120)
+  PROMETHEUS_MAX_QUERY_RANGE_SECONDS: int = Field(default=21600, ge=60, le=86400)
+  PROMETHEUS_MIN_QUERY_STEP_SECONDS: int = Field(default=15, ge=1, le=3600)
+  PROMETHEUS_MAX_EVALUATION_POINTS: int = Field(default=2000, ge=1, le=10000)
+  PROMETHEUS_MAX_SERIES: int = Field(default=100, ge=1, le=1000)
+  PROMETHEUS_MAX_RESPONSE_BYTES: int = Field(
+    default=524288,
+    ge=1024,
+    le=5242880,
+  )
+  PROMETHEUS_MAX_QUERY_LENGTH: int = Field(default=4096, ge=64, le=8192)
   TRACE_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
   TRACE_ALLOWED_HOSTS: str = ""
   TRACE_QUERY_TIMEOUT_SECONDS: int = Field(default=10, ge=1, le=60)
@@ -55,6 +68,20 @@ class Settings(BaseSettings):
     env_file_encoding="utf-8",
     extra="ignore",
   )
+
+  @model_validator(mode="after")
+  def validate_prometheus_timeouts(self) -> "Settings":
+    if self.PROMETHEUS_READ_TIMEOUT_SECONDS < self.PROMETHEUS_QUERY_TIMEOUT_SECONDS:
+      raise ValueError(
+        "PROMETHEUS_READ_TIMEOUT_SECONDS must be at least "
+        "PROMETHEUS_QUERY_TIMEOUT_SECONDS",
+      )
+    if self.PROMETHEUS_TOTAL_TIMEOUT_SECONDS < self.PROMETHEUS_QUERY_TIMEOUT_SECONDS:
+      raise ValueError(
+        "PROMETHEUS_TOTAL_TIMEOUT_SECONDS must be at least "
+        "PROMETHEUS_QUERY_TIMEOUT_SECONDS",
+      )
+    return self
 
   @property
   def cors_origins(self) -> list[str]:

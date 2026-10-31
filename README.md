@@ -226,17 +226,46 @@ Set `PROMETHEUS_ALLOWED_HOSTS` to a comma-separated exact-host allowlist and,
 for authenticated sources, set and back up `PROMETHEUS_CREDENTIAL_ENCRYPTION_KEY`.
 Generate a Fernet key with the command shown in the Loki setup above.
 Credentials are encrypted at rest and source responses expose only the auth
-type and whether credentials are configured. This configuration is not yet a
-direct query integration: Prometheus alert metadata is available only when
-included in a Grafana or Alertmanager notification; OpsPilot does not yet
-execute PromQL or fetch Prometheus time series.
+type and whether credentials are configured. Read-only PromQL queries are
+available to the incident tool registry as `prometheus.query_instant` and
+`prometheus.query_range`. The tools accept a source ID and PromQL, never a
+caller-supplied endpoint; source access is checked against the authorized
+incident project. M2 query results are not persisted as evidence; evidence
+integration is a separate milestone.
 
 Project owners can test the configured endpoint with
 `POST /projects/{project_id}/sources/{source_id}/prometheus/validate`. The
 check requests Prometheus's `/-/ready` endpoint without following redirects,
 and applies `PROMETHEUS_QUERY_TIMEOUT_SECONDS`. The source reports the latest
 connection status and check time; this check confirms reachability and
-authentication, not metric-query permissions.
+authentication, not metric-query permissions. The query tools exercise the
+actual Prometheus query APIs.
+
+Prometheus query resource limits have conservative defaults:
+
+| Setting | Default | Enforcement and rationale |
+| --- | ---: | --- |
+| `PROMETHEUS_CONNECT_TIMEOUT_SECONDS` | 3 seconds | Fail quickly when the configured host cannot connect. |
+| `PROMETHEUS_READ_TIMEOUT_SECONDS` | 15 seconds | Bound response stalls; defaults above the server query timeout. |
+| `PROMETHEUS_TOTAL_TIMEOUT_SECONDS` | 20 seconds | Bound total client work, including connection and response handling. |
+| `PROMETHEUS_QUERY_TIMEOUT_SECONDS` | 10 seconds | Cap Prometheus server-side execution time. |
+| `PROMETHEUS_MAX_QUERY_RANGE_SECONDS` | 21,600 (6 hours) | Keep investigation windows incident-sized. |
+| `PROMETHEUS_MIN_QUERY_STEP_SECONDS` | 15 seconds | Avoid overly dense range evaluations by default. |
+| `PROMETHEUS_MAX_EVALUATION_POINTS` | 2,000 | Bound work proportional to range-query resolution. |
+| `PROMETHEUS_MAX_SERIES` | 100 | Cap server-returned and locally returned time series. |
+| `PROMETHEUS_MAX_RESPONSE_BYTES` | 524,288 (512 KiB) | Bound memory and result size while streaming. |
+| `PROMETHEUS_MAX_QUERY_LENGTH` | 4,096 characters | Bound request parsing and expression size. |
+
+Query timeout and series-limit arguments may request lower limits; server
+settings cap larger requests. Each configured source is limited to 20 queries
+per minute. These bounds reduce accidental load but cannot prove a PromQL
+expression is computationally cheap: complex expressions can still consume
+Prometheus resources until its server-side timeout. Prometheus itself should
+also be protected with appropriate resource limits and access controls.
+
+Query tools report `success`, `empty`, `partial`, `unavailable`, or `error`.
+Provider warnings and possible series-limit truncation are marked partial;
+metric labels and provider annotations are treated as untrusted data.
 
 ### Instrument a FastAPI application
 

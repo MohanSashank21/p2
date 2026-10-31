@@ -203,7 +203,7 @@ calls; no live GitHub App was exercised during this review.
 | Combined investigation orchestration | **Partially implemented** | A tested synchronous integration orchestrator exists for Loki, Tempo, Docker, and GitHub; it is caller-directed and has no AI planning or durable run record. |
 | Source management and credential handling | **Verified working (isolated tests)** | Project-scoped source creation, one-time source credential, rotation/disable, encrypted Loki/Tempo configuration, and owner checks have passing tests. |
 | Grafana and Alertmanager webhooks | **Verified working (isolated tests)** | Payload, lifecycle, deduplication and Loki follow-up tests pass; no live provider delivery was performed here. |
-| Direct Prometheus querying | **Partially implemented** | Prometheus alert information can arrive through Grafana/Alertmanager, but no Prometheus source configuration or query client exists; the combined response reports `not_configured`. |
+| Direct Prometheus querying | **Implemented, live-verified** | Bounded read-only instant and range query tools use the configured source and project authorization. Docker Prometheus queries for `up`, an empty metric, and invalid PromQL were exercised; evidence persistence remains M3. |
 | Loki query/retrieval | **Verified working (mocked backend)** | Query validation, bounds, evidence persistence/deduplication, empty response and timeout are covered; no live Loki endpoint was contacted. |
 | Tempo trace retrieval | **Verified working (mocked backend)** | Configuration, validation, normalization, evidence persistence/deduplication, auth and timeout cases are covered; no live Tempo endpoint was contacted. |
 | Docker investigation | **Verified working (mocked daemon)** | Read-only access policy, normalization, log bounds/redaction, partial failures, and persistence are covered; no real Docker daemon was queried by this review. |
@@ -487,15 +487,33 @@ PostgreSQL. No live Prometheus endpoint or database migration was run.
 
 ### M2 — Bounded, read-only Prometheus query client
 
-**Status:** Pending M1.
+**Status:** Implemented; automated and live Docker verification complete.
 
-**Objective:** Reuse the configured source and implement a small Prometheus
-HTTP API client for a bounded incident time range.
+**Implemented:** Added a reusable async Prometheus HTTP client for instant
+`/api/v1/query` and range `/api/v1/query_range` requests, plus read-only
+`prometheus.query_instant` and `prometheus.query_range` registry tools. Tools
+resolve the configured Prometheus source through the existing project/source
+authorization service; they accept no endpoint URL and do not persist evidence.
+Existing encrypted none/bearer/basic authentication, exact host allowlisting,
+redirect rejection, and disabled environment proxy behavior are reused.
 
-**Acceptance:** Query time range, step, response bytes, result count, request
-timeout, redirects, and rate limits are bounded; malformed/error/empty results
-remain distinct; no write APIs or arbitrary endpoint paths are exposed; fake
-HTTP transport tests cover success and failures.
+**Bounds:** Defaults are a 3-second connect timeout, 15-second read timeout,
+20-second total request timeout, 10-second maximum server-side query timeout,
+six-hour maximum range, 15-second minimum step, 2,000 evaluation points, 100
+series, 512 KiB streamed response, 4,096-character PromQL expression, and 20
+queries per source per minute. Server caps override larger caller-supplied
+timeout and series limits. Oversized responses are rejected while streaming;
+results exceeding the series cap are locally truncated. Provider warnings and
+possible series truncation are reported as partial. These limits reduce but do
+not eliminate the cost of computationally expensive PromQL; Prometheus-side
+resource controls remain necessary.
+
+**Verification:** Prometheus query client and registry tests: 33 passed.
+Live Docker Prometheus tool-flow test: 1 passed, including source creation,
+readiness validation, instant and range queries for `up`, an empty-result
+query, invalid PromQL, and a range-limit rejection. The actual `up` response
+contained labeled series with value `"1"`. No evidence persistence or M3
+behavior was added.
 
 ### M3 — Prometheus incident evidence in the existing investigation API
 
@@ -629,13 +647,14 @@ production outage or destructive test is performed.
 - **Blocked/not attempted:** Live PostgreSQL migration state, real Redis Lua
   behavior, external observability endpoints, GitHub App connectivity, and
   real Docker daemon verification.
-- **Pending:** Review of M1.1/M1.2/M1.3 changes and separate approval before
-  starting M2, the bounded Prometheus query client.
-- **Not started:** M2 Prometheus query client; M3 Prometheus evidence
-  integration; deterministic correlation; durable runs; AI planning/synthesis;
-  frontend investigation review.
+- **Completed:** M2 bounded, read-only Prometheus instant/range query client,
+  registry tools, automated tests, and live verification against the local
+  Docker Prometheus instance.
+- **Not started:** M3 Prometheus evidence integration; deterministic
+  correlation; durable runs; AI planning/synthesis; frontend investigation
+  review.
 
-After M1.1/M1.2/M1.3 review and approval, the next increment is **M2: bounded,
-read-only Prometheus metric queries**. Prometheus incident evidence and its AI
-tool adapter remain unimplemented. No subsequent increment is authorized until
-the current diff is reviewed. The user makes all commits and pushes.
+The next roadmap increment is **M3: Prometheus incident evidence**. M2 tools
+are discoverable by the static registry but do not save query results. No M3
+implementation was included in this change. The user makes all commits and
+pushes.

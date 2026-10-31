@@ -87,6 +87,10 @@ def test_provider_tool_discovery_declares_evidence_persistence():
   assert tools["docker.investigate_incident_container"].persists_evidence is True
   assert tools["github.investigate_failed_workflow"].persists_evidence is True
   assert tools["incident.read_evidence"].persists_evidence is False
+  assert tools["prometheus.query_instant"].read_only is True
+  assert tools["prometheus.query_instant"].persists_evidence is False
+  assert tools["prometheus.query_range"].read_only is True
+  assert tools["prometheus.query_range"].persists_evidence is False
 
 
 @pytest.mark.asyncio

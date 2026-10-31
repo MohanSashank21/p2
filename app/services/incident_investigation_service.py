@@ -189,8 +189,10 @@ async def investigate_incident_integrations(
   results["prometheus"] = IntegrationInvestigationResult(
     status="not_configured",
     detail=(
-      "There is no direct Prometheus query integration. Prometheus alert "
-      "metadata is included when present in Grafana or Alertmanager evidence."
+      "Prometheus metrics are available through the incident tool registry. "
+      "This combined endpoint does not execute or persist Prometheus queries "
+      "until M3 evidence integration; alert metadata is included when present "
+      "in Grafana or Alertmanager evidence."
     ),
   )
 

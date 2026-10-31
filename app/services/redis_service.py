@@ -175,6 +175,19 @@ async def rate_limit_trace_queries(client: Redis, source_id: uuid.UUID) -> None:
   )
 
 
+async def rate_limit_prometheus_queries(
+  client: Redis,
+  source_id: uuid.UUID,
+) -> None:
+  await bump_rate_limit(
+    client,
+    "prometheus-query",
+    str(source_id),
+    limit=20,
+    window_seconds=60,
+  )
+
+
 async def limit_email_and_ip(
   client: Redis,
   email: str,

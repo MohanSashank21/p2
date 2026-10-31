@@ -51,6 +51,8 @@ from app.services import (
   trace_service,
 )
 from app.services.source_service import get_project_prometheus_source
+from app.tools.contracts import ToolContext
+from app.tools.registry import create_tool_registry
 from app.utils.jwt import create_access_token
 
 
@@ -892,6 +894,126 @@ async def test_prometheus_connection_validation_is_owner_only_and_records_status
   assert reset.status_code == 200
   assert reset.json()["prometheus_connection_status"] == "not_checked"
   assert reset.json()["prometheus_last_checked_at"] is None
+
+
+@pytest.mark.skipif(
+  os.getenv("OPSPILOT_RUN_PROMETHEUS_INTEGRATION") != "1",
+  reason="Set OPSPILOT_RUN_PROMETHEUS_INTEGRATION=1 for the live Docker Prometheus test",
+)
+@pytest.mark.asyncio
+async def test_live_prometheus_instant_range_empty_and_invalid_queries(
+  source_client,
+  monkeypatch,
+):
+  client, session_factory, fake_redis = source_client
+  monkeypatch.setattr(
+    settings,
+    "PROMETHEUS_ALLOWED_HOSTS",
+    "localhost:9091",
+  )
+  owner = await _create_user(session_factory, "live-prometheus-owner")
+  project_id = await _create_project(client, owner, "Live Prometheus project")
+  source = await client.post(
+    f"/projects/{project_id}/sources",
+    json={
+      "name": "Docker Prometheus",
+      "source_type": "prometheus",
+      "prometheus_url": "http://localhost:9091",
+    },
+    headers=_headers(owner),
+  )
+  assert source.status_code == 201
+  source_id = source.json()["id"]
+  validated = await client.post(
+    f"/projects/{project_id}/sources/{source_id}/prometheus/validate",
+    headers=_headers(owner),
+  )
+  assert validated.status_code == 200
+  assert validated.json()["prometheus_connection_status"] == "connected"
+
+  incident_response = await client.post(
+    f"/projects/{project_id}/incidents",
+    json={"incident_type": "manual", "title": "Live metric verification"},
+    headers=_headers(owner),
+  )
+  assert incident_response.status_code == 201
+  context = ToolContext(
+    session=session_factory(),
+    redis=fake_redis,
+    project_id=project_id,
+    incident_id=uuid.UUID(incident_response.json()["id"]),
+    user=owner,
+  )
+  registry = create_tool_registry()
+  now = datetime.now(UTC)
+
+  try:
+    instant = await registry.execute(
+      "prometheus.query_instant",
+      {"source_id": source_id, "expression": "up"},
+      context,
+    )
+    ranged = await registry.execute(
+      "prometheus.query_range",
+      {
+        "source_id": source_id,
+        "expression": "up",
+        "start": (now - timedelta(minutes=1)).isoformat(),
+        "end": now.isoformat(),
+        "step_seconds": 15,
+      },
+      context,
+    )
+    empty = await registry.execute(
+      "prometheus.query_instant",
+      {
+        "source_id": source_id,
+        "expression": "opspilot_metric_that_does_not_exist",
+      },
+      context,
+    )
+    invalid = await registry.execute(
+      "prometheus.query_instant",
+      {"source_id": source_id, "expression": "up{"},
+      context,
+    )
+    excessive_range = await registry.execute(
+      "prometheus.query_range",
+      {
+        "source_id": source_id,
+        "expression": "up",
+        "start": (now - timedelta(hours=7)).isoformat(),
+        "end": now.isoformat(),
+        "step_seconds": 15,
+      },
+      context,
+    )
+  finally:
+    await context.session.close()
+
+  assert instant.status == "success"
+  assert instant.data is not None
+  assert instant.data["result_type"] == "vector"
+  instant_series = instant.data["results"]
+  assert instant_series
+  assert any("job" in result["metric"] for result in instant_series)
+  assert any(result["value"][1] == "1" for result in instant_series)
+
+  assert ranged.status in {"success", "partial"}
+  assert ranged.data is not None
+  assert ranged.data["result_type"] == "matrix"
+  assert ranged.data["sample_count"] > 0
+  assert ranged.data["results"][0]["values"]
+
+  assert empty.status == "empty"
+  assert empty.data is not None
+  assert empty.data["result_count"] == 0
+  assert invalid.status == "error"
+  assert invalid.error is not None
+  assert invalid.error.code == "invalid_query"
+  assert excessive_range.status == "error"
+  assert excessive_range.error is not None
+  assert excessive_range.error.code == "query_limit_exceeded"
 
 
 @pytest.mark.asyncio
@@ -2869,7 +2991,7 @@ async def test_combined_incident_investigation_collects_all_available_evidence(
   assert result["integrations"]["grafana"]["status"] == "included"
   assert result["integrations"]["prometheus"]["status"] == "not_configured"
   assert result["integrations"]["prometheus"]["detail"].startswith(
-    "There is no direct Prometheus query integration.",
+    "Prometheus metrics are available through the incident tool registry.",
   )
   evidence_types = {item["evidence_type"] for item in result["evidence"]}
   assert {

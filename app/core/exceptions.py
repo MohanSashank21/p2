@@ -44,9 +44,16 @@ class LokiIntegrationError(Exception):
     super().__init__(detail)
 
 class PrometheusIntegrationError(Exception):
-  def __init__(self, status_code: int, detail: str):
+  def __init__(
+    self,
+    status_code: int,
+    detail: str,
+    *,
+    code: str = "prometheus_error",
+  ):
     self.status_code = status_code
     self.detail = detail
+    self.code = code
     super().__init__(detail)
 
 

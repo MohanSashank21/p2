@@ -371,6 +371,7 @@ async def investigate_incident_integrations_endpoint(
       )
     return await replay_investigation_response(session, run)
 
+  run_id = run.id
   try:
     async with asyncio.timeout(RUN_TIMEOUT_SECONDS):
       aggregate_status, integrations = await investigate_incident_integrations(
@@ -395,7 +396,7 @@ async def investigate_incident_integrations_endpoint(
       )
       await complete_investigation_run(
         session,
-        run.id,
+        run_id,
         aggregate_status,
         integrations,
         [item.id for item in evidence],
@@ -404,7 +405,7 @@ async def investigate_incident_integrations_endpoint(
   except asyncio.CancelledError:
     await fail_investigation_run(
       session,
-      run.id,
+      run_id,
       "request_cancelled",
       "The synchronous investigation request was cancelled.",
       status="cancelled",
@@ -413,7 +414,7 @@ async def investigate_incident_integrations_endpoint(
   except Exception as error:
     await fail_investigation_run(
       session,
-      run.id,
+      run_id,
       type(error).__name__,
       "The investigation ended before a result could be finalized.",
     )

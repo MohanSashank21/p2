@@ -103,6 +103,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+  runs = sa.table("investigation_runs", sa.column("id", sa.Uuid()))
+  if op.get_bind().scalar(
+    sa.select(sa.func.count()).select_from(runs),
+  ):
+    raise RuntimeError(
+      "Cannot downgrade while durable investigation run records exist",
+    )
   op.drop_index(
     "ix_investigation_runs_incident_started",
     table_name="investigation_runs",

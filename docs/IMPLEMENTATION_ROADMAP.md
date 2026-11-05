@@ -574,8 +574,8 @@ each timeline item points to source evidence and observed time.
 
 ### M5 — Durable investigation runs and bounded execution
 
-**Status:** Implemented as a synchronous durable-run layer; migration and
-deployment application remain pending.
+**Status:** Synchronous durable-run implementation and isolated migration
+validation complete; configured application database migration remains pending.
 
 **Objective:** Persist run status, requested sources, evidence references,
 timestamps, and failures so investigations can be retried and audited.
@@ -599,12 +599,14 @@ can explicitly retry by submitting a new request with a new idempotency key.
 This avoids silently repeating provider work. The response remains
 backward-compatible; the new response header and read endpoints are additive.
 
-**Verification:** Focused lifecycle tests cover successful and failed states,
-same-key replay, changed-request conflict, concurrent duplicate protection,
-cancellation, total timeout, stale-run recovery, and project authorization.
-The full backend suite is pending after this increment. The additive Alembic
-migration has not been applied to the configured data database; apply it with
-`alembic upgrade head` after reviewing this change.
+**Verification:** Focused lifecycle tests cover successful, partial, and
+failed states; same-key replay; changed-request conflict; concurrent
+duplicate protection; cancellation; total timeout; stale-run recovery; and
+project authorization. Full backend suite: **149 passed, 2 skipped**. The new
+Alembic revision was upgraded and downgraded successfully in a disposable
+PostgreSQL schema; its downgrade correctly refuses to delete populated run
+history. The configured application database remains at the prior revision
+until its migration is explicitly applied with `alembic upgrade head`.
 
 **Acceptance boundary:** Synchronous durability, idempotency, terminal/partial
 states, bounded execution, safe cancellation, and existing response
@@ -709,12 +711,12 @@ deployment.
   Prometheus, Loki, Tempo, and Grafana readiness endpoints returned HTTP 200;
   the Docker daemon answered a read-only `docker info` request. Git ignores
   the root `.env`; secret values were not printed or recorded.
-- **Repeat verification:** The full suite again passed **143 passed,
+- **Repeat verification before M5:** The full suite passed **143 passed,
   2 skipped**. The separately enabled live Prometheus tool-flow test passed
-  (**1 passed**). Read-only `alembic check` reported no new upgrade
-  operations. The running API still returned HTTP 200 for readiness and
-  OpenAPI (53 paths, 61 operations). No repository lint/type-check
-  configuration or installed `ruff`/`mypy` command was available.
+  (**1 passed**). Read-only `alembic check` reported no pre-M5 schema drift.
+  The running API returned HTTP 200 for readiness and OpenAPI (53 paths,
+  61 operations). No repository lint/type-check configuration or installed
+  `ruff`/`mypy` command was available.
 - **2026-11-05 authenticated Docker/auth checks:** Using an existing project
   membership and enabled Docker source, an ephemeral in-memory access token
   exercised the protected route: missing credentials returned HTTP 401;
@@ -751,9 +753,11 @@ deployment.
   acceptance record in `M4_ARCHITECTURE_DECISION.md`. GitHub remains an
   on-demand supplemental integration.
 - **Implemented, migration pending:** M5 durable synchronous investigation
-  runs; see the milestone section for retry and worker boundaries.
+  runs. The migration is verified in isolation but is not yet applied to the
+  configured application database; see the milestone section for retry and
+  worker boundaries.
 - **Not started:** M6 AI planning/synthesis; frontend investigation review.
 
-**Next milestone:** Review and apply the M5 migration in the intended
-environment, then proceed to M6 when separately approved. The user makes all
-commits and pushes.
+**Next step:** Apply the M5 migration in the intended environment, smoke-test
+the persisted run API there, then proceed to M6 when separately approved. The
+user makes all commits and pushes.

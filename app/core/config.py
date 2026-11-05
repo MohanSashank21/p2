@@ -24,11 +24,7 @@ class Settings(BaseSettings):
   PROMETHEUS_MIN_QUERY_STEP_SECONDS: int = Field(default=15, ge=1, le=3600)
   PROMETHEUS_MAX_EVALUATION_POINTS: int = Field(default=2000, ge=1, le=10000)
   PROMETHEUS_MAX_SERIES: int = Field(default=100, ge=1, le=1000)
-  PROMETHEUS_MAX_RESPONSE_BYTES: int = Field(
-    default=524288,
-    ge=1024,
-    le=5242880,
-  )
+  PROMETHEUS_MAX_RESPONSE_BYTES: int = Field(default=524288, ge=1024, le=5242880)
   PROMETHEUS_MAX_QUERY_LENGTH: int = Field(default=4096, ge=64, le=8192)
   TRACE_CREDENTIAL_ENCRYPTION_KEY: SecretStr | None = None
   TRACE_ALLOWED_HOSTS: str = ""
@@ -49,9 +45,7 @@ class Settings(BaseSettings):
   OTP_MAX_RESENDS: int = Field(default=3, ge=0, le=5)
   SMTP_HOST: str | None = None
   SMTP_PORT: int = Field(default=587, ge=1, le=65535)
-  SMTP_USER: str | None = Field(
-    default=None,
-    validation_alias=AliasChoices("SMTP_USERNAME", "SMTP_USER"),
+  SMTP_USER: str | None = Field(default=None,validation_alias=AliasChoices("SMTP_USERNAME""SMTP_USER"),
   )
   SMTP_PASSWORD: SecretStr | None = None
   SMTP_FROM: str | None = None

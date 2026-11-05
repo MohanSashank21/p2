@@ -973,12 +973,19 @@ async def test_investigation_runs_are_persisted_idempotent_and_project_scoped(
     _project_id,
     _incident_id,
     _user,
-    _request,
+    request,
   ):
     nonlocal calls
     calls += 1
-    return "success", {
-      "docker": IntegrationInvestigationResult(status="success"),
+    aggregate_status = (
+      "partial"
+      if request.docker.log_tail_lines == 30
+      else "success"
+    )
+    return aggregate_status, {
+      "docker": IntegrationInvestigationResult(
+        status="partial" if aggregate_status == "partial" else "success",
+      ),
     }
 
   monkeypatch.setattr(
@@ -1043,10 +1050,24 @@ async def test_investigation_runs_are_persisted_idempotent_and_project_scoped(
   retried = await client.post(
     endpoint,
     headers={**_headers(owner), "Idempotency-Key": "durable-test-run-2"},
-    json=request_body,
+    json={
+      "docker": {
+        **request_body["docker"],
+        "log_tail_lines": 30,
+      },
+    },
   )
   assert retried.status_code == 200
+  assert retried.json()["status"] == "partial"
   assert calls == 2
+  retried_history = await client.get(
+    f"/projects/{project_id}/incidents/{incident_id}/investigation-runs",
+    headers=_headers(owner),
+  )
+  assert [item["status"] for item in retried_history.json()] == [
+    "partial",
+    "succeeded",
+  ]
 
 
 @pytest.mark.asyncio

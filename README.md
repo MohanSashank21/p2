@@ -232,7 +232,8 @@ Each combined investigation now creates a durable run record while preserving
 the synchronous response body. The response includes an
 `X-Investigation-Run-ID` header. Use `Idempotency-Key` to make client retries
 safe: repeating the same key and request replays the saved response without
-calling providers again; reusing the key with a different request returns
+calling providers again; evidence contents are resolved from the current
+incident evidence records. Reusing the key with a different request returns
 HTTP 409. A duplicate request received while that run is still executing also
 returns HTTP 409 with its run ID. Keys are scoped to the requesting user,
 project, and incident.

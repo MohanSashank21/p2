@@ -162,6 +162,7 @@ async def fail_investigation_run(
   failure_detail: str,
   status: str = "failed",
 ) -> InvestigationRun:
+  await session.rollback()
   run = await session.get(InvestigationRun, run_id)
   if run is None:
     raise RuntimeError("Investigation run disappeared before failure was recorded")

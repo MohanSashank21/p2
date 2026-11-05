@@ -1,0 +1,153 @@
+x-deployment-labels: &deployment-labels
+  com.opspilot.environment: ${DEPLOYMENT_ENVIRONMENT:-local}
+  com.opspilot.deployment-id: ${DEPLOYMENT_ID:-portfolio-local}
+  org.opencontainers.image.version: ${SERVICE_VERSION:-local}
+  org.opencontainers.image.revision: ${VCS_REVISION:-unknown}
+
+services:
+  database:
+    image: postgres:16-alpine
+    container_name: portfolio-opspilot-test-database
+    labels: *deployment-labels
+    environment:
+      POSTGRES_DB: portfolio_test
+      POSTGRES_USER: portfolio_test
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in test-harness/.env}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - database-data:/var/lib/postgresql/data
+      - ./api/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U portfolio_test -d portfolio_test" ]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  database-monitor-bootstrap:
+    image: postgres:16-alpine
+    container_name: portfolio-opspilot-test-database-monitor-bootstrap
+    labels: *deployment-labels
+    environment:
+      POSTGRES_DB: portfolio_test
+      POSTGRES_USER: portfolio_test
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in test-harness/.env}
+      POSTGRES_EXPORTER_PASSWORD: ${POSTGRES_EXPORTER_PASSWORD:?Set POSTGRES_EXPORTER_PASSWORD in test-harness/.env}
+    volumes:
+      - ./database-monitor-bootstrap.sh:/scripts/database-monitor-bootstrap.sh:ro
+    entrypoint: [ "/bin/sh", "/scripts/database-monitor-bootstrap.sh" ]
+    depends_on:
+      database:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./api
+      args:
+        SERVICE_VERSION: ${SERVICE_VERSION:-local}
+        VCS_REVISION: ${VCS_REVISION:-unknown}
+    container_name: portfolio-opspilot-test-api
+    labels: *deployment-labels
+    environment:
+      DATABASE_URL: postgresql://portfolio_test:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in test-harness/.env}@database:5432/portfolio_test
+      LOKI_PUSH_URL: http://loki:3100/loki/api/v1/push
+      OPSPILOT_TEST_TOKEN: ${OPSPILOT_TEST_TOKEN:?Set OPSPILOT_TEST_TOKEN in test-harness/.env}
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://tempo:4318/v1/traces
+      DEPLOYMENT_ID: ${DEPLOYMENT_ID:-portfolio-local}
+      DEPLOYMENT_ENVIRONMENT: ${DEPLOYMENT_ENVIRONMENT:-local}
+      SERVICE_VERSION: ${SERVICE_VERSION:-local}
+      VCS_REVISION: ${VCS_REVISION:-unknown}
+    ports:
+      - "127.0.0.1:8010:8000"
+    depends_on:
+      database-monitor-bootstrap:
+        condition: service_completed_successfully
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  loki:
+    image: grafana/loki:3.5.0
+    container_name: portfolio-opspilot-test-loki
+    labels: *deployment-labels
+    command: [ "-config.file=/etc/loki/loki.yaml" ]
+    ports:
+      - "127.0.0.1:3101:3100"
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+
+  tempo:
+    image: grafana/tempo:2.7.2
+    container_name: portfolio-opspilot-test-tempo
+    labels: *deployment-labels
+    command: [ "-config.file=/etc/tempo/tempo.yaml" ]
+    ports:
+      - "127.0.0.1:3201:3200"
+      - "127.0.0.1:4319:4318"
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: portfolio-opspilot-test-prometheus
+    labels: *deployment-labels
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yaml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=1d"
+    ports:
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      api:
+        condition: service_started
+      postgres-exporter:
+        condition: service_started
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: portfolio-opspilot-test-postgres-exporter
+    labels: *deployment-labels
+    environment:
+      DATA_SOURCE_URI: database:5432/portfolio_test?sslmode=disable
+      DATA_SOURCE_USER: portfolio_monitor
+      DATA_SOURCE_PASS: ${POSTGRES_EXPORTER_PASSWORD:?Set POSTGRES_EXPORTER_PASSWORD in test-harness/.env}
+    depends_on:
+      database-monitor-bootstrap:
+        condition: service_completed_successfully
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: portfolio-opspilot-test-grafana
+    labels: *deployment-labels
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in test-harness/.env}
+    ports:
+      - "127.0.0.1:3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./prometheus-datasource.yaml:/etc/grafana/provisioning/datasources/prometheus.yaml:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  database-data:
+  loki-data:
+  tempo-data:
+  prometheus-data:
+  grafana-data:

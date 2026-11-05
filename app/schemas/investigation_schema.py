@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime
 from typing import Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -66,6 +67,7 @@ class IntegrationInvestigationResult(BaseModel):
     "unavailable",
     "included",
     "not_configured",
+    "not_requested",
   ]
   evidence_id: uuid.UUID | None = None
   detail: str | None = None
@@ -76,3 +78,22 @@ class CombinedIncidentInvestigationResponse(BaseModel):
   incident_id: uuid.UUID
   integrations: dict[str, IntegrationInvestigationResult]
   evidence: list[IncidentEvidenceResponse]
+
+
+class InvestigationRunResponse(BaseModel):
+  id: uuid.UUID
+  project_id: uuid.UUID
+  incident_id: uuid.UUID
+  requested_by_user_id: uuid.UUID | None
+  requested_integrations: list[str]
+  request_criteria: dict
+  status: Literal["running", "succeeded", "partial", "failed", "cancelled"]
+  aggregate_status: Literal["success", "partial", "unavailable"] | None
+  integrations: dict[str, IntegrationInvestigationResult] | None
+  evidence_ids: list[uuid.UUID]
+  failure_code: str | None
+  failure_detail: str | None
+  attempt_count: int
+  created_at: datetime
+  started_at: datetime
+  completed_at: datetime | None

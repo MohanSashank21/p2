@@ -72,7 +72,6 @@ class ToolNotFoundError(LookupError):
 @dataclass(frozen=True, slots=True)
 class ToolDefinition(Generic[InputT]):
   """An internal tool; read_only excludes provider mutations, not evidence writes."""
-
   name: str
   description: str
   input_model: type[InputT]

@@ -61,9 +61,14 @@ from app.services.trace_service import TraceQuery, retrieve_incident_traces
 
 
 def _failure(error: Exception) -> IntegrationInvestigationResult:
+  if isinstance(error, SourceNotFoundError):
+    return IntegrationInvestigationResult(
+      status="not_configured",
+      detail=str(error),
+    )
   if isinstance(error, RateLimitExceededError):
     detail = str(error)
-  elif isinstance(error, (SourceNotFoundError, SourceConfigurationError)):
+  elif isinstance(error, SourceConfigurationError):
     detail = str(error)
   elif isinstance(
     error,
@@ -209,10 +214,8 @@ async def investigate_incident_integrations(
       ),
     )
   results["prometheus"] = IntegrationInvestigationResult(
-    status="not_configured",
-    detail=(
-      "Provide a bounded Prometheus query to retrieve and persist metric evidence."
-    ),
+    status="not_requested",
+    detail="No Prometheus query was requested.",
   )
 
   if request.prometheus is not None:

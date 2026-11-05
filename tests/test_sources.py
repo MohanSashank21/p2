@@ -1,3 +1,4 @@
+import base64
 import asyncio
 import json
 import os
@@ -2271,6 +2272,10 @@ async def test_tempo_query_normalizes_and_deduplicates_incident_evidence(
     '{ status=error && resource.service.name="checkout-api" }'
   )
   assert calls[1].url.path == f"/api/traces/{trace_id}"
+  assert all(
+    call.headers["accept-encoding"] == "identity"
+    for call in calls
+  )
 
   return_empty = True
   empty_start = start - timedelta(minutes=1)
@@ -2296,6 +2301,7 @@ async def test_tempo_query_normalizes_and_deduplicates_incident_evidence(
   assert by_trace_id.json()["status"] == "success"
   assert calls[-1].url.path == f"/api/traces/{trace_id}"
 
+
   unbounded = await client.post(
     url,
     json={
@@ -2319,6 +2325,62 @@ async def test_tempo_query_normalizes_and_deduplicates_incident_evidence(
   assert len(evidence) == 3
   assert persisted_incident is not None
   assert persisted_incident.status == "open"
+
+
+def test_tempo_normalizes_base64_otlp_trace_and_span_ids():
+  trace_id = "23641aceab39a622cb7bb63774a4f5a8"
+  span_id = "c158a2ef7c9d60ab"
+  parent_span_id = "70df3651e8803dac"
+  payload = {
+    "resourceSpans": [
+      {
+        "resource": {
+          "attributes": [
+            {
+              "key": "service.name",
+              "value": {"stringValue": "portfolio-api"},
+            },
+          ],
+        },
+        "scopeSpans": [
+          {
+            "spans": [
+              {
+                "traceId": base64.b64encode(bytes.fromhex(trace_id)).decode(),
+                "spanId": base64.b64encode(bytes.fromhex(span_id)).decode(),
+                "parentSpanId": base64.b64encode(
+                  bytes.fromhex(parent_span_id),
+                ).decode(),
+                "name": "portfolio.contact.persist",
+                "startTimeUnixNano": "1793545070363802018",
+                "endTimeUnixNano": "1793545070400000000",
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  }
+
+  normalized = trace_service.normalize_tempo_trace(payload, trace_id)
+
+  assert normalized["trace_id"] == trace_id
+  assert normalized["spans"] == [
+    {
+      "trace_id": trace_id,
+      "span_id": span_id,
+      "parent_span_id": parent_span_id,
+      "service_name": "portfolio-api",
+      "name": "portfolio.contact.persist",
+      "start_time_unix_nano": "1793545070363802018",
+      "duration_nanos": "36197982",
+      "duration_ms": 36.197982,
+      "status": "unset",
+      "status_message": None,
+      "attributes": {},
+      "resource_attributes": {"service.name": "portfolio-api"},
+    },
+  ]
 
 
 @pytest.mark.asyncio
@@ -3191,9 +3253,9 @@ async def test_combined_incident_investigation_collects_all_available_evidence(
   }
   assert result["status"] == "success"
   assert result["integrations"]["grafana"]["status"] == "included"
-  assert result["integrations"]["prometheus"]["status"] == "not_configured"
+  assert result["integrations"]["prometheus"]["status"] == "not_requested"
   assert result["integrations"]["prometheus"]["detail"].startswith(
-    "Provide a bounded Prometheus query",
+    "No Prometheus query was requested",
   )
   evidence_types = {item["evidence_type"] for item in result["evidence"]}
   assert {
@@ -3250,6 +3312,45 @@ async def test_combined_incident_investigation_collects_all_available_evidence(
     if item["evidence_type"] == "github_context"
   ]
   assert len(github_evidence) == 1
+
+
+@pytest.mark.asyncio
+async def test_combined_investigation_distinguishes_unconfigured_from_unrequested(
+  source_client,
+):
+  client, session_factory, _redis = source_client
+  owner = await _create_user(session_factory, "unconfigured-source-owner")
+  project_id = await _create_project(
+    client,
+    owner,
+    "Unconfigured source project",
+  )
+  incident = await _create_labeled_test_incident(session_factory, project_id)
+  now = datetime.now(UTC)
+
+  response = await client.post(
+    f"/projects/{project_id}/incidents/{incident.id}/investigate",
+    headers=_headers(owner),
+    json={
+      "loki": {
+        "source_id": str(uuid.uuid4()),
+        "start": (now - timedelta(minutes=1)).isoformat(),
+        "end": now.isoformat(),
+        "labels": {"environment": "test"},
+      },
+    },
+  )
+
+  assert response.status_code == 200, response.text
+  body = response.json()
+  assert body["integrations"]["prometheus"]["status"] == "not_requested"
+  assert body["integrations"]["loki"]["status"] == "not_configured"
+  assert body["integrations"]["loki"]["evidence_id"] is None
+  assert body["status"] == "unavailable"
+  assert not any(
+    evidence["evidence_type"] == "loki_logs"
+    for evidence in body["evidence"]
+  )
 
 
 @pytest.mark.asyncio
@@ -3414,7 +3515,7 @@ async def test_combined_prometheus_investigation_persists_partial_evidence(
   assert cross_project.status_code == 200
   assert (
     cross_project.json()["integrations"]["prometheus"]["status"]
-    == "unavailable"
+    == "not_configured"
   )
   assert len(queries) == 2
 

@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hashlib
 import ipaddress
 import json
@@ -143,7 +145,10 @@ def encrypt_trace_auth(
 
 
 def _request_headers(connection: TempoConnection) -> tuple[dict[str, str], Any]:
-  headers = {"Accept": "application/json"}
+  headers = {
+    "Accept": "application/json",
+    "Accept-Encoding": "identity",
+  }
   if connection.tenant_id:
     headers["X-Scope-OrgID"] = connection.tenant_id
   if connection.auth_type == "none":
@@ -341,6 +346,31 @@ def _span_status(span: dict[str, Any]) -> tuple[str, str | None]:
   return normalized, message if isinstance(message, str) and message else None
 
 
+def _normalize_tempo_id(value: Any, byte_length: int, field: str) -> str:
+  if not isinstance(value, str):
+    raise TraceIntegrationError(502, f"Tempo returned an invalid {field}")
+  expected_lengths = (
+    (8, 16)
+    if field in {"trace ID", "search trace ID"}
+    else (byte_length,)
+  )
+  if any(
+    re.fullmatch(rf"[0-9a-fA-F]{{{length * 2}}}", value)
+    for length in expected_lengths
+  ):
+    return value.lower()
+  try:
+    decoded = base64.b64decode(value, validate=True)
+  except (binascii.Error, ValueError) as error:
+    raise TraceIntegrationError(
+      502,
+      f"Tempo returned an invalid {field}",
+    ) from error
+  if len(decoded) not in expected_lengths:
+    raise TraceIntegrationError(502, f"Tempo returned an invalid {field}")
+  return decoded.hex()
+
+
 def normalize_tempo_trace(
   payload: dict[str, Any],
   requested_trace_id: str | None = None,
@@ -349,7 +379,11 @@ def normalize_tempo_trace(
   if not isinstance(batches, list):
     raise TraceIntegrationError(502, "Tempo returned invalid trace spans")
   normalized_spans: list[dict[str, Any]] = []
-  trace_id = requested_trace_id
+  trace_id = (
+    _normalize_tempo_id(requested_trace_id, 16, "trace ID")
+    if requested_trace_id is not None
+    else None
+  )
   for batch in batches:
     if not isinstance(batch, dict):
       raise TraceIntegrationError(502, "Tempo returned invalid trace spans")
@@ -375,11 +409,11 @@ def normalize_tempo_trace(
           raise TraceIntegrationError(502, "Tempo returned invalid trace spans")
         span_trace_id = span.get("traceId", span.get("traceID"))
         if span_trace_id is not None:
-          if (
-            not isinstance(span_trace_id, str)
-            or not TRACE_ID_PATTERN.fullmatch(span_trace_id)
-          ):
-            raise TraceIntegrationError(502, "Tempo returned an invalid trace ID")
+          span_trace_id = _normalize_tempo_id(
+            span_trace_id,
+            16,
+            "trace ID",
+          )
           if (
             requested_trace_id is not None
             and span_trace_id.lower() != requested_trace_id.lower()
@@ -404,6 +438,14 @@ def normalize_tempo_trace(
         span_status, status_message = _span_status(span)
         span_id = span.get("spanId", span.get("spanID"))
         parent_span_id = span.get("parentSpanId", span.get("parentSpanID"))
+        if span_id is not None:
+          span_id = _normalize_tempo_id(span_id, 8, "span ID")
+        if parent_span_id is not None:
+          parent_span_id = _normalize_tempo_id(
+            parent_span_id,
+            8,
+            "parent span ID",
+          )
         name = span.get("name")
         normalized_spans.append(
           {
@@ -429,7 +471,9 @@ def normalize_tempo_trace(
             "Tempo trace exceeded the 2,000 span limit",
           )
   if trace_id is None:
-    trace_id = payload.get("traceID", payload.get("traceId"))
+    trace_id_value = payload.get("traceID", payload.get("traceId"))
+    if trace_id_value is not None:
+      trace_id = _normalize_tempo_id(trace_id_value, 16, "trace ID")
   if not isinstance(trace_id, str) or not TRACE_ID_PATTERN.fullmatch(trace_id):
     if normalized_spans:
       trace_id = normalized_spans[0]["trace_id"]
@@ -492,9 +536,11 @@ def _normalize_search_traces(payload: dict[str, Any]) -> list[dict[str, Any]]:
   for item in traces:
     if not isinstance(item, dict):
       raise TraceIntegrationError(502, "Tempo returned invalid search results")
-    trace_id = item.get("traceID")
-    if not isinstance(trace_id, str) or not TRACE_ID_PATTERN.fullmatch(trace_id):
-      raise TraceIntegrationError(502, "Tempo returned an invalid search trace ID")
+    trace_id = _normalize_tempo_id(
+      item.get("traceID"),
+      16,
+      "search trace ID",
+    )
     start_time = item.get("startTimeUnixNano")
     try:
       start_ns = int(start_time)

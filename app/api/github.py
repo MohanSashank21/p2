@@ -50,6 +50,38 @@ from app.services.github_project_service import (
 router = APIRouter(prefix="/projects/{project_id}/github", tags=["github"])
 github_webhook_router = APIRouter(prefix="/webhooks", tags=["github"])
 _NON_FAILURE_WORKFLOW_CONCLUSIONS = {"success", "neutral", "skipped", "cancelled"}
+MAX_GITHUB_WEBHOOK_BODY_BYTES = 1_048_576
+
+
+async def _read_limited_webhook_body(request: Request) -> bytes:
+  content_length = request.headers.get("content-length")
+  if content_length is not None:
+    try:
+      declared_length = int(content_length)
+    except ValueError as error:
+      raise HTTPException(
+        status_code=400,
+        detail="Invalid Content-Length header",
+      ) from error
+    if declared_length < 0:
+      raise HTTPException(status_code=400, detail="Invalid Content-Length header")
+    if declared_length > MAX_GITHUB_WEBHOOK_BODY_BYTES:
+      raise HTTPException(
+        status_code=413,
+        detail="GitHub webhook payload exceeds the 1 MiB limit",
+      )
+
+  chunks: list[bytes] = []
+  body_size = 0
+  async for chunk in request.stream():
+    body_size += len(chunk)
+    if body_size > MAX_GITHUB_WEBHOOK_BODY_BYTES:
+      raise HTTPException(
+        status_code=413,
+        detail="GitHub webhook payload exceeds the 1 MiB limit",
+      )
+    chunks.append(chunk)
+  return b"".join(chunks)
 
 
 def _raise_project_access_error(error: Exception) -> HTTPException:
@@ -401,7 +433,7 @@ async def receive_github_webhook(
       detail="GitHub webhook secret is not configured",
     )
 
-  raw = await request.body()
+  raw = await _read_limited_webhook_body(request)
   signature = request.headers.get("x-hub-signature-256")
   if not signature:
     raise HTTPException(status_code=403, detail="Missing GitHub webhook signature")

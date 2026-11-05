@@ -14,6 +14,7 @@ from app.db import (
   github,
   incident,
   incident_source,
+  investigation_run,
   project,
   project_membership,
   user,

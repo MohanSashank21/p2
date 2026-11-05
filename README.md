@@ -227,6 +227,33 @@ explicit container ID, and GitHub investigations require a failed or
 unexpected workflow event. Every backend can return `success`, `empty`,
 `partial`, or `unavailable`; the aggregate response also returns the incident's
 persisted evidence.
+
+Each combined investigation now creates a durable run record while preserving
+the synchronous response body. The response includes an
+`X-Investigation-Run-ID` header. Use `Idempotency-Key` to make client retries
+safe: repeating the same key and request replays the saved response without
+calling providers again; reusing the key with a different request returns
+HTTP 409. A duplicate request received while that run is still executing also
+returns HTTP 409 with its run ID. Keys are scoped to the requesting user,
+project, and incident.
+
+Project members can inspect bounded run history and individual run status:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /projects/{project_id}/incidents/{incident_id}/investigation-runs?limit=50&offset=0` | List recent runs, up to 100 per page. |
+| `GET /projects/{project_id}/incidents/{incident_id}/investigation-runs/{run_id}` | Read requested integrations, status, outcomes, evidence IDs, and timestamps. |
+
+Runs execute synchronously with a five-minute total deadline. Terminal states
+are `succeeded`, `partial`, `failed`, and `cancelled`; stale `running` records
+older than the deadline plus one minute are marked failed when history/status
+is read or a new run is submitted. Each run has one execution attempt; there
+are no automatic provider retries. To deliberately retry, submit a new
+request with a new idempotency key. Provider-specific timeouts and existing
+evidence deduplication still apply. The schema migration that adds
+`investigation_runs` must be applied with `alembic upgrade head` before using
+these endpoints.
+
 Prometheus can be requested with either an instant query (`source_id`,
 `expression`, and optional `evaluation_time`) or a range query (`source_id`,
 `expression`, `start`, `end`, and `step_seconds`). Its bounded result is saved
@@ -551,6 +578,8 @@ that repository. It does not create repository-level GitHub webhooks or send
 GitHub comments, statuses, or notifications. A local development server needs
 a running public HTTPS tunnel; temporary quick-tunnel URLs stop working when the
 tunnel exits and are not suitable for a permanent webhook URL.
+The webhook body is limited to 1 MiB; oversized deliveries are rejected with
+HTTP 413 before JSON parsing.
 
 `GET /projects/{project_id}/github/repositories/{repository_id}/webhook-events`
 lists events already received and stored; an empty list means no matching
@@ -564,6 +593,16 @@ ten most recent commits up to the failing commit, and workflow logs. This
 investigation context is fetched on demand rather than stored or fetched for
 every webhook; log output and code-file retrieval are bounded. It does not
 create an incident automatically.
+
+To persist that context on an existing incident, first get the event ID from
+the webhook-events endpoint, then include its connected GitHub repository ID
+and event ID in the `github` criteria of
+`POST /projects/{project_id}/incidents/{incident_id}/investigate`. The combined
+endpoint stores `github_context` evidence on that incident. The context
+endpoint can correlate it by exact workflow-run ID, commit SHA, or repository
+identity when other evidence contains the same identifier. GitHub evidence is
+never automatically attached to an incident, and time or generic labels alone
+are not used to infer a match.
 
 ## Current scope
 

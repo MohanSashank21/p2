@@ -15,6 +15,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import settings
+from app.api import github as github_api
 from app.db import github, project_membership, user
 from app.db.base import Base
 from app.db.database import get_db
@@ -158,6 +159,29 @@ async def test_github_webhook_is_verified_and_deduplicated(github_client):
     assert duplicate_body["accepted"] is True
     assert duplicate_body["duplicate"] is True
     assert duplicate_body["stored_count"] == 0
+  finally:
+    settings.GITHUB_WEBHOOK_SECRET = original_secret
+
+
+@pytest.mark.asyncio
+async def test_github_webhook_rejects_oversized_body_before_parsing(
+  github_client,
+  monkeypatch,
+):
+  client, _session_factory = github_client
+  original_secret = settings.GITHUB_WEBHOOK_SECRET
+  settings.GITHUB_WEBHOOK_SECRET = SecretStr("test-webhook-secret")
+  monkeypatch.setattr(github_api, "MAX_GITHUB_WEBHOOK_BODY_BYTES", 32)
+  try:
+    response = await client.post(
+      "/webhooks/github",
+      content=b"x" * 33,
+      headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert response.json()["detail"] == (
+      "GitHub webhook payload exceeds the 1 MiB limit"
+    )
   finally:
     settings.GITHUB_WEBHOOK_SECRET = original_secret
 

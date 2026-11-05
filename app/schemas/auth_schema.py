@@ -20,7 +20,6 @@ class RegisterRequest(BaseModel):
   email: EmailStr
   display_name: str = Field(min_length=1, max_length=120)
   password: str = Field(min_length=8, max_length=128)
-
   @field_validator("display_name")
   @classmethod
   def validate_display_name(cls, display_name: str) -> str:
@@ -28,7 +27,6 @@ class RegisterRequest(BaseModel):
     if not display_name:
       raise ValueError("Display name cannot be blank")
     return display_name
-
   @field_validator("password")
   @classmethod
   def validate_password(cls, password: str) -> str:
@@ -45,7 +43,6 @@ class OTPVerifyRequest(OTPRequest):
 
 class OTPResendRequest(OTPRequest):
   purpose: Literal["register", "login", "reset"]
-
   @field_validator("purpose", mode="before")
   @classmethod
   def normalize_purpose(cls, purpose: object) -> object:
@@ -73,7 +70,6 @@ class PasswordResetVerifiedResponse(BaseModel):
 class PasswordChangeRequest(BaseModel):
   current_password: str = Field(min_length=1, max_length=128)
   new_password: str = Field(min_length=8, max_length=128)
-
   @field_validator("new_password")
   @classmethod
   def validate_new_password(cls, password: str) -> str:
@@ -86,7 +82,6 @@ class TokenResponse(BaseModel):
   access_token: str
   token_type: Literal["bearer"] = "bearer"
   expires_in: int
-
 
 class UserResponse(BaseModel):
   id: uuid.UUID

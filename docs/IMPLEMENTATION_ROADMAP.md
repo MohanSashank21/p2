@@ -1,8 +1,8 @@
 # OpsPilot AI: system verification and implementation roadmap
 
-**Status:** Phase 1 repository verification complete. The static tool
-architecture and Loki/Tempo/Docker/GitHub/incident-evidence adapters are
-implemented. Further increments remain approval-gated.
+**Status:** M4 live acceptance is complete. Current local verification
+supports proceeding to M5; M9 remains partial because these checks do not
+certify every production environment or every provider failure mode.
 
 **Repository baseline:** `main` at `5ccb57e` (`add the git and open telemtry
 services`) when this review began.
@@ -184,36 +184,40 @@ GitHub webhook
 The app requests read access for Actions, Contents, and Metadata. The webhook
 stores unexpected/failed completed workflow runs, not successful runs or
 in-progress events. It does not create incidents automatically. Context is
-fetched on demand. GitHub behavior in the test suite uses mocked GitHub client
-calls; no live GitHub App was exercised during this review.
+fetched on demand. An authenticated live combined-investigation request
+successfully fetched and persisted context for an existing real failed
+Portfolio workflow run. The matching incident did not contain the event's
+workflow-run ID or commit SHA, so no cross-source GitHub correlation was
+reported. Automated GitHub provider tests use mocks; see the M4 decision record
+for the live run identifiers and evidence.
 
 ## Capability verification matrix
 
 | Subsystem | Status | Evidence and boundary |
 |---|---|---|
-| Authentication (registration/login OTP, password reset/change, refresh/logout) | **Verified working** | Auth API tests pass with temporary SQLite and fake Redis; real Redis Lua behavior and SMTP delivery were not exercised. |
+| Authentication (registration/login OTP, password reset/change, refresh/logout) | **Partially live-verified** | Auth API tests pass with temporary SQLite/fake email delivery. The actual Redis OTP and rate-limit Lua scripts passed isolated live checks. Real SMTP delivery and the complete registration/login flow were not independently exercised in this pass; the user confirmed those workflows work. |
 | User management | **Verified working** | User creation and auth flows are covered by passing tests. |
 | Organization management and membership | **Not implemented (intentionally removed)** | Current model/API has project membership only; legacy tables were removed by migration; old-route test expects 404. |
 | Project authorization and owner/member permissions | **Verified working** | Project and source tests cover membership/owner boundaries and project isolation using SQLite. |
-| Database models and relationships | **Implemented, not fully verified** | SQLAlchemy metadata and SQLite test setup work; PostgreSQL constraint/locking behavior is not fully covered. |
-| Async SQLAlchemy session management | **Implemented, not fully verified** | Request-scoped async session and `pool_pre_ping` are present; tests exercise SQLite rather than the configured PostgreSQL deployment. |
-| Alembic migrations | **Implemented, not fully verified** | One migration head and linear history were inspected; no live database schema/version was queried and no migration was applied. |
-| Redis | **Implemented, not fully verified** | OTP, rate-limit and GitHub setup state use Redis; tests use fakes, not a live Redis server or concurrent Lua execution. |
+| Database models and relationships | **Live schema-checked; concurrency partial** | Configured local PostgreSQL readiness succeeded and `alembic check` found no metadata drift. The PostgreSQL row-lock concurrency test remains skipped in the normal SQLite suite. |
+| Async SQLAlchemy session management | **Live readiness verified** | The running API queried its configured PostgreSQL successfully; request-path tests also pass with SQLite. This does not certify every production deployment/pool condition. |
+| Alembic migrations | **Current database verified at head** | `alembic current` reported `91d6c3a8f4b2` and read-only `alembic check` reported no pending operations. No migration was applied during verification; blank-database and upgrade-from-every-historical-revision paths were not rerun. |
+| Redis | **Live script paths verified** | API readiness passed. The real rate-limit Lua script rejected over-limit calls, and the real OTP Lua challenge accepted a generated code and locked out after the configured invalid attempts using temporary unique keys. No real email delivery was triggered; GitHub setup state was not re-exercised in this pass. |
 | Incident creation and lifecycle | **Verified working** | Tests cover manual/webhook creation, evidence, project isolation, valid transitions, and active-alert resolution guard in SQLite. |
 | Combined investigation orchestration | **Partially implemented** | A tested synchronous integration orchestrator exists for Loki, Tempo, Docker, and GitHub; it is caller-directed and has no AI planning or durable run record. |
 | Source management and credential handling | **Verified working (isolated tests)** | Project-scoped source creation, one-time source credential, rotation/disable, encrypted Loki/Tempo configuration, and owner checks have passing tests. |
-| Grafana and Alertmanager webhooks | **Verified working (isolated tests)** | Payload, lifecycle, deduplication and Loki follow-up tests pass; no live provider delivery was performed here. |
+| Grafana and Alertmanager webhooks | **Live-verified (acceptance scenario)** | Payload, lifecycle, deduplication and Loki follow-up tests pass; a live Grafana alert was delivered to OpsPilot with HTTP 200 and updated the test incident. |
 | Direct Prometheus querying | **Implemented, live-verified** | Bounded read-only instant and range query tools use the configured source and project authorization. The combined investigation API persists query results as incident evidence. Docker Prometheus queries for `up`, an empty metric, invalid PromQL, and persisted `up` evidence were exercised. |
-| Loki query/retrieval | **Verified working (mocked backend)** | Query validation, bounds, evidence persistence/deduplication, empty response and timeout are covered; no live Loki endpoint was contacted. |
-| Tempo trace retrieval | **Verified working (mocked backend)** | Configuration, validation, normalization, evidence persistence/deduplication, auth and timeout cases are covered; no live Tempo endpoint was contacted. |
-| Docker investigation | **Verified working (mocked daemon)** | Read-only access policy, normalization, log bounds/redaction, partial failures, and persistence are covered; no real Docker daemon was queried by this review. |
-| GitHub App and workflow investigation | **Verified working (mocked GitHub API)** | Webhook signature/filter/dedup and on-demand workflow context are covered; live GitHub credentials or endpoints were not used. |
+| Loki query/retrieval | **Live-verified (acceptance scenario)** | Query validation, bounds, evidence persistence/deduplication, empty response and timeout are covered by tests; a live authenticated investigation persisted a log entry containing the controlled trace ID. |
+| Tempo trace retrieval | **Live-verified (acceptance scenario)** | Configuration, validation, normalization, evidence persistence/deduplication, auth and timeout cases are covered by tests; a live authenticated investigation persisted six spans for the controlled trace ID. |
+| Docker investigation | **Live-verified (read-only, no persistence)** | Authenticated OpsPilot validation, container listing, and investigation of the existing test API container all succeeded. Missing credentials returned 401. No incident ID was supplied, so evidence was not persisted; failure paths and persistence remain covered by automated mocked-daemon tests. |
+| GitHub App and workflow investigation | **Live-verified (on-demand retrieval only)** | A real stored failed Portfolio run was retrieved through the authenticated incident investigation API and persisted as evidence; no exact correlation to other incident evidence was present. Automated provider tests use mocks. |
 | CI/CD integration | **Partially implemented** | GitHub Actions workflow-run evidence is available on demand; no auto-created incident, CI deployment metadata integration, or checked-in OpsPilot CI workflow was found. |
 | LLM/AI investigation and recommendations | **Not implemented** | No LLM dependency, provider configuration, prompt/tool orchestration, structured finding, or model-output persistence was found. |
 | Background execution | **Not implemented** | Integration queries and webhook follow-up execute in API requests; no task queue, worker, scheduler, or durable investigation job was found. |
 | API contracts | **Verified working (test boundary)** | FastAPI routes and Pydantic request/response models are present; OpenAPI/webhook and endpoint tests pass. No separate compatibility/versioning policy was found. |
 | Logging, metrics, tracing, health | **Partially implemented** | Python logging and DB/Redis health/readiness endpoints exist. No OpsPilot Prometheus metrics or OpenTelemetry instrumentation/dependency was found. |
-| Automated tests | **Verified working (isolated suite)** | Baseline: 71 passed; after Loki: 77 passed; after Tempo: 80 passed; after Docker: 83 passed; after GitHub: 86 passed; after incident evidence: 90 passed; latest focused evidence/incident/source tests: 36 passed, 1 skipped; one PostgreSQL row-lock test skipped. One unrelated auth test failed once during a prior run, passed alone, and passed in the repeated full suite. External-service behavior is mocked. |
+| Automated tests | **Verified working (isolated suite plus opt-in live test)** | Current full backend suite: 143 passed, 2 skipped. The opt-in live Prometheus integration test was run separately and passed. The PostgreSQL-dependent row-lock test remains skipped in the full SQLite test suite; external-provider tests generally use mocks. |
 | Docker/local development configuration | **Partially implemented** | README documents API setup and a Redis `docker run`; no tracked OpsPilot Compose file or app Dockerfile was found. PostgreSQL must be available/configured separately. |
 
 ## Reusable components and design constraints
@@ -546,12 +550,23 @@ caller-supplied time ranges matched to the incident or alert.
 
 ### M4 — Deterministic incident context and cross-source correlation
 
-**Status:** Next; pending implementation.
+**Status:** Complete; live three-source acceptance passed on 2026-11-05.
 
 **Objective:** Build a model-independent context from incident time, provider
 labels, service/environment/deployment identifiers, and persisted evidence.
 Select only safe, supported queries; never invent service/container/repository
 identifiers.
+
+**Implemented and verified:** The authenticated incident context endpoint
+summarizes persisted evidence, bounded timeline events, source coverage, metric
+series and transitions, and deterministic correlations. Timeline events
+reference persisted evidence. The full backend suite passed 143 tests with
+2 skipped. A live Grafana alert reached OpsPilot; an authenticated investigation
+persisted nonempty Prometheus, Loki, and Tempo evidence for a fresh controlled
+operation. The subsequent authenticated context response reported an exact
+`shared_trace_id` correlation between the Loki log and Tempo spans. See the
+2026-11-05 acceptance record in `docs/M4_ARCHITECTURE_DECISION.md`; it
+supersedes the earlier historical-window partial result.
 
 **Acceptance:** Correlation decisions are deterministic and testable; mismatched
 labels, missing context, and conflicting deployment metadata are surfaced;
@@ -559,20 +574,47 @@ each timeline item points to source evidence and observed time.
 
 ### M5 — Durable investigation runs and bounded execution
 
-**Status:** Pending M4; detailed design required before coding.
+**Status:** Implemented as a synchronous durable-run layer; migration and
+deployment application remain pending.
 
 **Objective:** Persist run status, requested sources, evidence references,
 timestamps, and failures so investigations can be retried and audited.
 Introduce a worker only if measured request latency/reliability justifies it;
 use durable PostgreSQL state rather than relying on ephemeral Redis.
 
-**Acceptance:** Idempotent run creation, bounded retries/timeouts, explicit
-terminal/partial states, safe cancellation behavior, and no loss of existing
-synchronous endpoint behavior without a versioned migration plan.
+**Implemented:** Existing `POST .../investigate` remains synchronous and
+retains its response body. Every request now reserves a PostgreSQL run row
+before provider work, persists requested criteria, integration outcomes,
+evidence IDs, timestamps, terminal state, and sanitized failures, and returns
+the run ID in `X-Investigation-Run-ID`. Optional `Idempotency-Key` is scoped to
+user/project/incident; identical replay returns saved results without rerunning
+providers, while changed criteria returns HTTP 409. Added authorized,
+paginated run history and run-status endpoints. The run deadline is five
+minutes; cancellation is recorded; still-running records older than six
+minutes are marked interrupted on the next run/status/history request.
+
+Automatic retries and a worker are intentionally not included: each run has
+one attempt, provider timeouts already bound individual calls, and an operator
+can explicitly retry by submitting a new request with a new idempotency key.
+This avoids silently repeating provider work. The response remains
+backward-compatible; the new response header and read endpoints are additive.
+
+**Verification:** Focused lifecycle tests cover successful and failed states,
+same-key replay, changed-request conflict, concurrent duplicate protection,
+cancellation, total timeout, stale-run recovery, and project authorization.
+The full backend suite is pending after this increment. The additive Alembic
+migration has not been applied to the configured data database; apply it with
+`alembic upgrade head` after reviewing this change.
+
+**Acceptance boundary:** Synchronous durability, idempotency, terminal/partial
+states, bounded execution, safe cancellation, and existing response
+compatibility are implemented. Automatic retry/backoff and background worker
+recovery are deferred unless production latency/reliability measurements
+justify them.
 
 ### M6 — Evidence-grounded AI synthesis
 
-**Status:** Pending M4 and M5.
+**Status:** Pending M5.
 
 **Objective:** Add a provider-neutral LLM boundary that receives only
 least-necessary, bounded, untrusted evidence and returns validated structured
@@ -610,7 +652,8 @@ recorded; deny-by-default tests cover unauthorized and stale approvals.
 
 ### M9 — Live integration and operational acceptance
 
-**Status:** Pending deployment access and safe test window.
+**Status:** Partial; local development-stack checks passed on 2026-11-05, but
+not every integration has been exercised end to end through OpsPilot.
 
 **Objective:** Verify configured PostgreSQL, Redis, Prometheus/Grafana, Loki,
 Tempo, Docker, and GitHub integrations using a disposable test incident and
@@ -619,23 +662,26 @@ non-production data.
 **Acceptance:** Each system has a documented live check, query bounds,
 credential/permission requirements, evidence example, and failure behavior;
 database migration is checked against an actual PostgreSQL instance; no
-production outage or destructive test is performed.
+production outage or destructive test is performed. The current local
+verification checkpoint is recorded below; it does not certify a production
+deployment.
 
 ## Risks and open constraints
 
 1. **Database-specific behavior:** The test suite uses SQLite. One concurrency
    test is skipped unless PostgreSQL is used. Migration history does not prove
    a deployed database is at the head; verify that separately before migration.
-2. **External systems:** Passing mocked tests does not establish live service
-   availability or correct deployment credentials. This review did not read
-   `.env` or contact configured systems.
+2. **External systems:** Passing mocked tests does not establish production
+   service availability or deployment credentials. The local-stack live
+   checks below do not certify another environment; `.env` values were not
+   displayed or recorded.
 3. **Request latency and retries:** Combined integration and alert-triggered
    Loki requests run in API request paths and sequentially. Slow backends can
    increase request latency; durable background execution is not present.
-4. **GitHub webhook payload bound:** Unlike generic source payload handling,
-   the GitHub webhook currently reads the request body without an application
-   level byte limit. Add an explicit size limit before relying on it for
-   untrusted/high-volume production traffic.
+4. **GitHub webhook payload bound:** The GitHub webhook now streams and rejects
+   request bodies larger than 1 MiB before parsing. This bounds application
+   memory use for the unauthenticated webhook route; upstream and proxy limits
+   should also be configured.
 5. **Sensitive evidence:** Logs, alert payloads, trace attributes, and code
    diffs may contain secrets or personal data. Existing bounds/redaction are
    not a complete guarantee; define retention, access, and additional
@@ -652,20 +698,62 @@ production outage or destructive test is performed.
 
 ## Review gate and current progress
 
+- **2026-11-05 broad local validation:** Full backend suite **143 passed,
+  2 skipped**. The app started successfully; `/health` and `/health/ready`
+  returned HTTP 200 with PostgreSQL and Redis ready. The live OpenAPI document
+  returned HTTP 200 with 53 paths and 61 operations. `alembic current` on the
+  configured local PostgreSQL reported the single migration head
+  `91d6c3a8f4b2`. The real Redis rate-limit Lua path allowed two requests and
+  rejected the third using a unique expiring validation key. The opt-in live
+  Prometheus integration test passed against the local Prometheus service.
+  Prometheus, Loki, Tempo, and Grafana readiness endpoints returned HTTP 200;
+  the Docker daemon answered a read-only `docker info` request. Git ignores
+  the root `.env`; secret values were not printed or recorded.
+- **Repeat verification:** The full suite again passed **143 passed,
+  2 skipped**. The separately enabled live Prometheus tool-flow test passed
+  (**1 passed**). Read-only `alembic check` reported no new upgrade
+  operations. The running API still returned HTTP 200 for readiness and
+  OpenAPI (53 paths, 61 operations). No repository lint/type-check
+  configuration or installed `ruff`/`mypy` command was available.
+- **2026-11-05 authenticated Docker/auth checks:** Using an existing project
+  membership and enabled Docker source, an ephemeral in-memory access token
+  exercised the protected route: missing credentials returned HTTP 401;
+  authenticated Docker validate and container-list calls returned HTTP 200;
+  the read-only investigation of the existing
+  `portfolio-opspilot-test-api` container returned `success`. No incident ID
+  was supplied, so no evidence was persisted; container logs and credentials
+  were not printed. The real Redis OTP Lua challenge accepted its generated
+  code and rejected/locked after three invalid attempts using unique synthetic
+  email identifiers; no email was sent and no database record was created.
+- **User acceptance:** The user confirmed that end-to-end registration/login,
+  real email delivery, and the remaining deployment-specific workflows are
+  working and asked to leave them unchanged. These were not independently
+  re-tested in this validation pass; this records the user's acceptance, not
+  new live verification. Previously recorded live GitHub retrieval and M4
+  Prometheus/Loki/Tempo evidence remain bounded to those specific flows.
+- **Gate:** The user accepts the remaining checks as working. M4's live
+  three-source acceptance and the broader local checks are complete; M5 may
+  proceed. This is not a claim that every production environment was
+  independently audited.
 - **Completed:** Phase 1 source inspection, safe isolated test baseline,
   migration graph inspection, data-flow tracing, capability classification,
   roadmap draft, and Stage 1.1/1.2/1.3/1.4/1.5 registry, Loki, Tempo, Docker,
   GitHub, and incident-evidence tool adapters.
-- **Blocked/not attempted:** Live PostgreSQL migration state, real Redis Lua
-  behavior, external observability endpoints, GitHub App connectivity, and
-  real Docker daemon verification.
 - **Completed:** M2 bounded, read-only Prometheus instant/range query client,
   registry tools, automated tests, and live verification against the local
   Docker Prometheus instance.
 - **Completed:** M3 Prometheus incident evidence in the combined investigation
   API, with query-hash deduplication and evidence-reader support.
-- **Not started:** deterministic correlation; durable runs; AI
-  planning/synthesis; frontend investigation review.
+- **Completed:** M4 deterministic context and correlation implementation,
+  automated tests, live authenticated investigation, and context retrieval
+  with successful Prometheus, Loki, and Tempo evidence. The context reports
+  the exact shared trace ID between Loki and Tempo; see the 2026-11-05
+  acceptance record in `M4_ARCHITECTURE_DECISION.md`. GitHub remains an
+  on-demand supplemental integration.
+- **Implemented, migration pending:** M5 durable synchronous investigation
+  runs; see the milestone section for retry and worker boundaries.
+- **Not started:** M6 AI planning/synthesis; frontend investigation review.
 
-The next roadmap increment is **M4: deterministic incident context and
-cross-source correlation**. The user makes all commits and pushes.
+**Next milestone:** Review and apply the M5 migration in the intended
+environment, then proceed to M6 when separately approved. The user makes all
+commits and pushes.

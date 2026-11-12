@@ -15,6 +15,7 @@ from fastapi import (
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import get_current_user
+from app.core.config import settings
 from app.core.exceptions import (
   IncidentNotFoundError,
   InvalidIncidentTransitionError,
@@ -46,6 +47,10 @@ from app.schemas.investigation_schema import (
   CombinedIncidentInvestigationResponse,
   InvestigationRunResponse,
 )
+from app.schemas.investigation_synthesis_schema import (
+  InvestigationSynthesisRunResponse,
+  UnsupportedEvidenceCitationError,
+)
 from app.schemas.source_schema import LokiQueryRequest, TraceQueryRequest
 from app.services.incident_service import (
   create_manual_incident,
@@ -68,13 +73,32 @@ from app.services.investigation_run_service import (
   reserve_investigation_run,
   RUN_TIMEOUT_SECONDS,
 )
+from app.services.gemini_synthesis_service import (
+  GeminiSynthesisConfigurationError,
+  GeminiSynthesisError,
+  GeminiSynthesisProviderError,
+  GeminiSynthesisTimeoutError,
+  create_gemini_client,
+  synthesize_evidence,
+)
+from app.services.investigation_synthesis_service import (
+  InvestigationSynthesisContextError,
+  build_run_synthesis_input,
+  claim_run_synthesis,
+  complete_run_synthesis,
+  fail_run_synthesis,
+  synthesis_run_response,
+)
 from app.services.incident_context_service import build_incident_context
 from app.services.loki_service import (
   LokiConnection,
   persist_loki_evidence,
   query_loki,
 )
-from app.services.redis_service import rate_limit_loki_queries
+from app.services.redis_service import (
+  rate_limit_gemini_synthesis,
+  rate_limit_loki_queries,
+)
 from app.services.source_service import get_project_loki_source
 from app.services.source_service import get_project_trace_source
 from app.services.trace_service import (
@@ -141,9 +165,28 @@ def _investigation_run_response(
     failure_code=run.failure_code,
     failure_detail=run.failure_detail,
     attempt_count=run.attempt_count,
+    synthesis_status=run.synthesis_status,
+    synthesis_report=run.synthesis_report,
+    synthesis_model=run.synthesis_model,
+    synthesis_prompt_version=run.synthesis_prompt_version,
+    synthesis_schema_version=run.synthesis_schema_version,
+    synthesis_input_tokens=run.synthesis_input_tokens,
+    synthesis_output_tokens=run.synthesis_output_tokens,
+    synthesis_provider_attempts=run.synthesis_provider_attempts,
+    synthesis_attempt_count=run.synthesis_attempt_count,
+    synthesis_failure_code=run.synthesis_failure_code,
+    synthesis_completed_at=run.synthesis_completed_at,
     created_at=run.created_at,
     started_at=run.started_at,
     completed_at=run.completed_at,
+  )
+
+
+def _synthesis_run_response(
+  run: InvestigationRun,
+) -> InvestigationSynthesisRunResponse:
+  return InvestigationSynthesisRunResponse.model_validate(
+    synthesis_run_response(run),
   )
 
 @router.post("", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED)
@@ -296,6 +339,178 @@ async def get_investigation_run_status(
   if run is None:
     raise HTTPException(status_code=404, detail="Investigation run not found")
   return _investigation_run_response(run)
+
+
+@router.get(
+  "/{incident_id}/investigation-runs/{run_id}/synthesis",
+  response_model=InvestigationSynthesisRunResponse,
+)
+async def get_investigation_synthesis_status(
+  project_id: uuid.UUID,
+  incident_id: uuid.UUID,
+  run_id: uuid.UUID,
+  user: User = Depends(get_current_user),
+  session: AsyncSession = Depends(get_db),
+) -> InvestigationSynthesisRunResponse:
+  try:
+    await get_project_incident(session, project_id, incident_id, user)
+  except (ProjectNotFoundError, IncidentNotFoundError, PermissionDeniedError) as error:
+    raise _raise_access_error(error) from error
+  run = await get_investigation_run(session, incident_id, run_id)
+  if run is None or run.project_id != project_id:
+    raise HTTPException(status_code=404, detail="Investigation run not found")
+  return _synthesis_run_response(run)
+
+
+@router.post(
+  "/{incident_id}/investigation-runs/{run_id}/synthesis",
+  response_model=InvestigationSynthesisRunResponse,
+)
+async def synthesize_investigation_run(
+  project_id: uuid.UUID,
+  incident_id: uuid.UUID,
+  run_id: uuid.UUID,
+  user: User = Depends(get_current_user),
+  redis: Redis = Depends(get_redis),
+  session: AsyncSession = Depends(get_db),
+) -> InvestigationSynthesisRunResponse:
+  try:
+    incident = await get_project_incident(
+      session,
+      project_id,
+      incident_id,
+      user,
+    )
+  except (ProjectNotFoundError, IncidentNotFoundError, PermissionDeniedError) as error:
+    raise _raise_access_error(error) from error
+
+  run = await get_investigation_run(session, incident_id, run_id)
+  if run is None or run.project_id != project_id:
+    raise HTTPException(status_code=404, detail="Investigation run not found")
+  if run.status not in {"succeeded", "partial"}:
+    raise HTTPException(
+      status_code=409,
+      detail="AI synthesis requires a completed successful or partial run.",
+    )
+  if run.synthesis_status == "succeeded":
+    return _synthesis_run_response(run)
+  if not settings.GEMINI_SYNTHESIS_ENABLED:
+    raise HTTPException(
+      status_code=503,
+      detail="AI synthesis is disabled by server configuration.",
+    )
+  api_key = settings.GEMINI_API_KEY
+  if api_key is None:
+    raise HTTPException(
+      status_code=503,
+      detail="Gemini synthesis is not configured on the server.",
+    )
+
+  try:
+    serialized_context, evidence_ids = await build_run_synthesis_input(
+      session,
+      incident,
+      run,
+    )
+  except InvestigationSynthesisContextError as error:
+    raise HTTPException(
+      status_code=error.status_code,
+      detail={"code": error.code, "message": error.message},
+    ) from error
+
+  try:
+    await rate_limit_gemini_synthesis(redis, project_id, user.id)
+  except RateLimitExceededError as error:
+    raise HTTPException(
+      status_code=429,
+      detail=str(error),
+      headers={"Retry-After": "3600"},
+    ) from error
+
+  claimed = await claim_run_synthesis(
+    session,
+    run_id,
+    settings.GEMINI_SYNTHESIS_MAX_RUN_ATTEMPTS,
+  )
+  if not claimed:
+    await session.refresh(run)
+    if run.synthesis_status == "succeeded":
+      return _synthesis_run_response(run)
+    if run.synthesis_status == "running":
+      raise HTTPException(
+        status_code=409,
+        detail="AI synthesis for this run is already in progress.",
+      )
+    raise HTTPException(
+      status_code=409,
+      detail="The configured AI synthesis attempt limit was reached.",
+    )
+
+  async def record_failure(
+    code: str,
+    provider_attempts: int | None = None,
+  ) -> None:
+    await fail_run_synthesis(
+      session,
+      run_id,
+      code,
+      provider_attempts,
+    )
+
+  try:
+    async with create_gemini_client() as client:
+      result = await synthesize_evidence(
+        serialized_context,
+        evidence_ids,
+        api_key.get_secret_value(),
+        client,
+      )
+    completed = await complete_run_synthesis(session, run_id, result)
+  except asyncio.CancelledError:
+    await record_failure("request_cancelled")
+    raise
+  except GeminiSynthesisTimeoutError as error:
+    await record_failure("provider_timeout", error.attempts)
+    raise HTTPException(
+      status_code=504,
+      detail="Gemini synthesis timed out; no report was produced.",
+    ) from error
+  except GeminiSynthesisProviderError as error:
+    await record_failure(
+      f"provider_http_{error.status_code}",
+      error.attempts,
+    )
+    status_code = (
+      429
+      if error.status_code == 429
+      else 503
+      if error.status_code >= 500
+      else 502
+    )
+    raise HTTPException(
+      status_code=status_code,
+      detail=str(error),
+    ) from error
+  except GeminiSynthesisConfigurationError as error:
+    await record_failure("provider_not_configured")
+    raise HTTPException(
+      status_code=503,
+      detail="Gemini synthesis is not configured on the server.",
+    ) from error
+  except UnsupportedEvidenceCitationError as error:
+    await record_failure("unsupported_evidence_citation")
+    raise HTTPException(
+      status_code=502,
+      detail="Gemini returned a citation outside this run's evidence.",
+    ) from error
+  except GeminiSynthesisError as error:
+    await record_failure("synthesis_invalid_or_unavailable")
+    raise HTTPException(
+      status_code=502,
+      detail="Gemini did not produce a valid evidence-grounded report.",
+    ) from error
+
+  return _synthesis_run_response(completed)
 
 
 @router.post(

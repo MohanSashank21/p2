@@ -35,6 +35,7 @@ class ToolRegistry:
         name=tool.name,
         description=tool.description,
         input_schema=tool.input_model.model_json_schema(mode="validation"),
+        output_schema=ToolResult.model_json_schema(mode="serialization"),
         read_only=tool.read_only,
         persists_evidence=tool.persists_evidence,
       )

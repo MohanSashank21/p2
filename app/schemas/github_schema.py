@@ -71,6 +71,10 @@ class GitHubWebhookEventResponse(BaseModel):
   delivery_id: str
   event_name: str
   action: str | None
+  incident_id: str | None
+  processing_status: str
+  attempt_count: int
+  last_failure_code: str | None
   payload: dict[str, Any]
   received_at: datetime
 

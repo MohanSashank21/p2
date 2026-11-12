@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import io
@@ -7,6 +8,7 @@ import secrets
 import uuid
 import zipfile
 
+import httpx
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -26,7 +28,8 @@ from app.db.github import (
 )
 from app.db.user import User
 from app.main import app
-from app.services.github_service import _logs_from_archive
+from app.services import github_service
+from app.services.github_service import GitHubClient, _logs_from_archive
 from app.utils.jwt import create_access_token
 
 
@@ -89,6 +92,64 @@ async def _create_project(client: AsyncClient, owner: User, name: str) -> uuid.U
 
 
 @pytest.mark.asyncio
+async def test_github_client_sends_installation_token_only_as_bearer_header():
+  expected_token = "synthetic-installation-token"
+
+  async def handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers["authorization"] == f"Bearer {expected_token}"
+    assert expected_token not in str(request.url)
+    return httpx.Response(200, json={"ok": True})
+
+  client = GitHubClient(
+    expected_token,
+    transport=httpx.MockTransport(handler),
+  )
+
+  assert await client.json("GET", "/app/installations/123") == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_installation_token_exchange_requests_read_only_permissions(monkeypatch):
+  monkeypatch.setattr(
+    github_service,
+    "create_app_jwt",
+    lambda: "synthetic-app-jwt",
+  )
+
+  class MockAsyncClient:
+    def __init__(self, *, base_url: str, timeout: int):
+      assert base_url == "https://api.github.com"
+      assert timeout > 0
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *_args):
+      return None
+
+    async def post(self, path: str, *, headers: dict, json: dict):
+      assert path == "/app/installations/123/access_tokens"
+      assert headers["Authorization"] == "Bearer synthetic-app-jwt"
+      assert json == {
+        "permissions": {
+          "actions": "read",
+          "contents": "read",
+          "metadata": "read",
+        },
+      }
+      return httpx.Response(
+        201,
+        json={"token": "synthetic-installation-token"},
+      )
+
+  monkeypatch.setattr(github_service.httpx, "AsyncClient", MockAsyncClient)
+
+  assert await github_service.create_installation_token(123) == (
+    "synthetic-installation-token"
+  )
+
+
+@pytest.mark.asyncio
 async def test_github_webhook_is_verified_and_deduplicated(github_client):
   client, session_factory = github_client
   owner = await _create_user(session_factory, "owner")
@@ -121,7 +182,12 @@ async def test_github_webhook_is_verified_and_deduplicated(github_client):
     payload = {
       "action": "completed",
       "repository": {"id": 456, "full_name": "example/project"},
-      "workflow_run": {"conclusion": "failure"},
+      "workflow_run": {
+        "id": 789,
+        "name": "CI",
+        "conclusion": "failure",
+        "head_sha": "a" * 40,
+      },
     }
     raw = json.dumps(payload).encode("utf-8")
     signature = "sha256=" + hmac.new(
@@ -129,6 +195,16 @@ async def test_github_webhook_is_verified_and_deduplicated(github_client):
       raw,
       hashlib.sha256,
     ).hexdigest()
+
+    missing_delivery = await client.post(
+      "/webhooks/github",
+      content=raw,
+      headers={
+        "x-github-event": "workflow_run",
+        "x-hub-signature-256": signature,
+      },
+    )
+    assert missing_delivery.status_code == 400
 
     response = await client.post(
       "/webhooks/github",
@@ -159,6 +235,26 @@ async def test_github_webhook_is_verified_and_deduplicated(github_client):
     assert duplicate_body["accepted"] is True
     assert duplicate_body["duplicate"] is True
     assert duplicate_body["stored_count"] == 0
+
+    concurrent_headers = {
+      "x-github-event": "workflow_run",
+      "x-github-delivery": "delivery-concurrent",
+      "x-hub-signature-256": signature,
+    }
+    concurrent_responses = await asyncio.gather(
+      client.post(
+        "/webhooks/github",
+        content=raw,
+        headers=concurrent_headers,
+      ),
+      client.post(
+        "/webhooks/github",
+        content=raw,
+        headers=concurrent_headers,
+      ),
+    )
+    assert all(response.status_code == 202 for response in concurrent_responses)
+    assert sum(response.json()["stored_count"] for response in concurrent_responses) == 1
   finally:
     settings.GITHUB_WEBHOOK_SECRET = original_secret
 

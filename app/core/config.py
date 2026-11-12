@@ -38,6 +38,10 @@ class Settings(BaseSettings):
   GITHUB_WEBHOOK_SECRET: SecretStr | None = None
   GITHUB_API_URL: str = "https://api.github.com"
   GITHUB_API_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=60)
+  GEMINI_API_KEY: SecretStr | None = None
+  GEMINI_MODEL: str = "gemini-2.5-flash"
+  GEMINI_SYNTHESIS_ENABLED: bool = False
+  GEMINI_SYNTHESIS_MAX_RUN_ATTEMPTS: int = Field(default=2, ge=1, le=3)
   ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, ge=1, le=60)
   REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, ge=1, le=90)
   OTP_EXPIRE_MINUTES: int = Field(default=5, ge=1, le=30)
@@ -45,7 +49,9 @@ class Settings(BaseSettings):
   OTP_MAX_RESENDS: int = Field(default=3, ge=0, le=5)
   SMTP_HOST: str | None = None
   SMTP_PORT: int = Field(default=587, ge=1, le=65535)
-  SMTP_USER: str | None = Field(default=None,validation_alias=AliasChoices("SMTP_USERNAME""SMTP_USER"),
+  SMTP_USER: str | None = Field(
+    default=None,
+    validation_alias=AliasChoices("SMTP_USERNAME", "SMTP_USER"),
   )
   SMTP_PASSWORD: SecretStr | None = None
   SMTP_FROM: str | None = None

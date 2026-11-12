@@ -9,5 +9,6 @@ pwdlib[argon2]
 email-validator
 redis>=5,<7
 httpx
+python-dotenv
 cryptography
 docker>=7,<8

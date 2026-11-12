@@ -94,6 +94,17 @@ class InvestigationRunResponse(BaseModel):
   failure_code: str | None
   failure_detail: str | None
   attempt_count: int
+  synthesis_status: Literal["not_started", "running", "succeeded", "failed"]
+  synthesis_report: dict | None
+  synthesis_model: str | None
+  synthesis_prompt_version: str | None
+  synthesis_schema_version: str | None
+  synthesis_input_tokens: int | None
+  synthesis_output_tokens: int | None
+  synthesis_provider_attempts: int | None
+  synthesis_attempt_count: int
+  synthesis_failure_code: str | None
+  synthesis_completed_at: datetime | None
   created_at: datetime
   started_at: datetime
   completed_at: datetime | None

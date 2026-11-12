@@ -188,6 +188,20 @@ async def rate_limit_prometheus_queries(
   )
 
 
+async def rate_limit_gemini_synthesis(
+  client: Redis,
+  project_id: uuid.UUID,
+  user_id: uuid.UUID,
+) -> None:
+  await bump_rate_limit(
+    client,
+    "gemini-synthesis",
+    f"{project_id}:{user_id}",
+    limit=3,
+    window_seconds=3600,
+  )
+
+
 async def limit_email_and_ip(
   client: Redis,
   email: str,

@@ -43,6 +43,7 @@ def _tool(
     description=f"Test tool {name}",
     input_model=EchoArguments,
     handler=handler,
+    read_only=True,
   )
 
 
@@ -60,6 +61,11 @@ def test_registry_rejects_duplicate_names_and_lists_stably():
     "title": "Value",
     "type": "integer",
   }
+  assert registry.list_tools()[0].output_schema["properties"]["status"] == {
+    "enum": ["success", "empty", "partial", "unavailable", "error"],
+    "title": "Status",
+    "type": "string",
+  }
   assert registry.list_tools()[0].read_only is True
   assert registry.list_tools()[0].persists_evidence is False
   with pytest.raises(ValueError, match="Duplicate tool name"):
@@ -72,6 +78,15 @@ def test_registry_rejects_duplicate_names_and_lists_stably():
         input_model=EchoArguments,
         handler=handler,
         read_only=False,
+      ),
+    )
+  with pytest.raises(ValueError, match="Only read-only"):
+    registry.register(
+      ToolDefinition(
+        name="test.unspecified",
+        description="A tool without a read-only classification",
+        input_model=EchoArguments,
+        handler=handler,
       ),
     )
 

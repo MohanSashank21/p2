@@ -683,12 +683,16 @@ def _append_timeline_events(
           timestamp_kind="docker_event_time",
           summary="Docker container event observed",
         )
-    elif evidence.evidence_type == "github_context":
+    elif evidence.evidence_type in {
+      "github_context",
+      "github_workflow_event",
+    }:
       run = _dict(normalized.get("workflow_run"))
       for name, key in (
         ("started", "run_started_at"),
         ("created", "created_at"),
         ("updated", "updated_at"),
+        ("completed", "completed_at"),
       ):
         timestamp = run.get(key)
         if timestamp is not None:
@@ -1295,12 +1299,12 @@ async def build_incident_context(
       source_keys[item.id] = str(
         source_events[item.source_event_id].source_id,
       )
-    elif item.evidence_type == "github_context":
+    elif item.evidence_type in {"github_context", "github_workflow_event"}:
       repository_id = _dict(item.normalized_content).get("repository_id")
       if isinstance(repository_id, int) and not isinstance(repository_id, bool):
         source_keys[item.id] = f"github:{repository_id}"
       else:
-        source_keys[item.id] = "type:github_context"
+        source_keys[item.id] = f"type:{item.evidence_type}"
     else:
       source_keys[item.id] = f"type:{item.evidence_type}"
 

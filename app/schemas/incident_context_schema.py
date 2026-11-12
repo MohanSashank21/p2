@@ -19,6 +19,7 @@ class IncidentContextEvidence(BaseModel):
     "trace_spans",
     "docker_investigation",
     "prometheus_metrics",
+    "github_workflow_event",
   ]
   source_id: uuid.UUID | None
   source_event_id: uuid.UUID | None

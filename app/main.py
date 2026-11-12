@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import asyncio
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -7,8 +9,9 @@ from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
-from app.db.database import check_database_connection, engine
+from app.db.database import AsyncSessionLocal, check_database_connection, engine
 from app.api.router import api_router
+from app.services.github_event_worker import run_github_event_worker
 from app.utils.jwt import validate_auth_token_configuration
 
 @asynccontextmanager
@@ -26,9 +29,13 @@ async def lifespan(app: FastAPI):
   )
   
   app.state.redis = redis_client
+  worker_task: asyncio.Task | None = None
   try:
     await redis_client.ping()
     await check_database_connection()
+    worker_task = asyncio.create_task(
+      run_github_event_worker(AsyncSessionLocal),
+    )
     yield
   except RedisError:
     raise RuntimeError(
@@ -37,6 +44,12 @@ async def lifespan(app: FastAPI):
   except SQLAlchemyError:
     raise RuntimeError("PostgreSQL is unavailable") from None
   finally:
+    if worker_task is not None:
+      worker_task.cancel()
+      try:
+        await worker_task
+      except asyncio.CancelledError:
+        pass
     try:
       await redis_client.aclose()
     finally:

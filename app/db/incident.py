@@ -25,7 +25,7 @@ class Incident(Base):
   __tablename__ = "incidents"
   __table_args__ = (
     CheckConstraint(
-      "source_type IN ('manual', 'generic_webhook', 'alertmanager', 'grafana')",
+      "source_type IN ('manual', 'generic_webhook', 'alertmanager', 'grafana', 'github')",
       name="ck_incidents_source_type",
     ),
     CheckConstraint(
@@ -109,7 +109,7 @@ class IncidentEvidence(Base):
       "evidence_type IN ('manual_report', 'webhook_payload', "
       "'alertmanager_notification', 'grafana_notification', 'loki_logs', "
       "'github_context', 'trace_spans', 'docker_investigation', "
-      "'prometheus_metrics')",
+      "'prometheus_metrics', 'github_workflow_event')",
       name="ck_incident_evidence_type",
     ),
     UniqueConstraint(

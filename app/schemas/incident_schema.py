@@ -38,7 +38,13 @@ class IncidentResponse(BaseModel):
   environment_id: uuid.UUID | None
   source_event_id: uuid.UUID | None
   reported_by_user_id: uuid.UUID | None
-  source_type: Literal["manual", "generic_webhook", "alertmanager", "grafana"]
+  source_type: Literal[
+    "manual",
+    "generic_webhook",
+    "alertmanager",
+    "grafana",
+    "github",
+  ]
   incident_type: str
   title: str
   description: str | None
@@ -63,6 +69,7 @@ class IncidentEvidenceResponse(BaseModel):
     "trace_spans",
     "docker_investigation",
     "prometheus_metrics",
+    "github_workflow_event",
   ]
   incident_source_id: uuid.UUID | None = None
   original_content: dict

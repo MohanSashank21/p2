@@ -301,7 +301,6 @@ def _safe_container_configuration(attrs: dict[str, Any]) -> dict[str, Any]:
     "container_labels_included": False,
   }
 
-
 def _collect_image_metadata(client: docker.DockerClient, attrs: dict[str, Any]) -> dict[str, Any]:
   image_id = attrs.get("Image")
   if not isinstance(image_id, str) or not image_id:
@@ -318,7 +317,6 @@ def _collect_image_metadata(client: docker.DockerClient, attrs: dict[str, Any]) 
     "architecture": image_attrs.get("Architecture"),
     "layer_count": len(rootfs.get("Layers") or []),
   }
-
 
 def _collect_recent_events(
   client: docker.DockerClient,
@@ -506,6 +504,7 @@ def _collect_investigation_sync(
     ("image", lambda: _collect_image_metadata(client, attrs)),
     ("events", lambda: _collect_recent_events(client, str(container.id))),
   )
+  
   for component, collector in collectors:
     try:
       result[component] = collector()

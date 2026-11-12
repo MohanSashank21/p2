@@ -127,6 +127,14 @@ class GitHubWebhookEvent(Base):
       "delivery_id",
       name="uq_github_webhook_events_project_delivery",
     ),
+    CheckConstraint(
+      "processing_status IN ('pending', 'processing', 'retry', 'processed', 'failed')",
+      name="ck_github_webhook_events_processing_status",
+    ),
+    CheckConstraint(
+      "attempt_count >= 0",
+      name="ck_github_webhook_events_attempt_count",
+    ),
   )
 
   id: Mapped[uuid.UUID] = mapped_column(
@@ -150,7 +158,92 @@ class GitHubWebhookEvent(Base):
   event_name: Mapped[str] = mapped_column(String(64), nullable=False)
   action: Mapped[str | None] = mapped_column(String(64), nullable=True)
   payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+  incident_id: Mapped[uuid.UUID | None] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("incidents.id", ondelete="SET NULL"),
+    nullable=True,
+    index=True,
+  )
+  workflow_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+  commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+  processing_status: Mapped[str] = mapped_column(
+    String(16),
+    nullable=False,
+    default="pending",
+    server_default="pending",
+    index=True,
+  )
+  attempt_count: Mapped[int] = mapped_column(
+    default=0,
+    server_default="0",
+    nullable=False,
+  )
+  available_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+  )
+  lease_expires_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+  )
+  last_failure_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+  processed_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True),
+    nullable=True,
+  )
   received_at: Mapped[datetime] = mapped_column(
+    DateTime(timezone=True),
+    server_default=func.now(),
+    nullable=False,
+  )
+
+
+class GitHubIncidentCorrelation(Base):
+  __tablename__ = "github_incident_correlations"
+  __table_args__ = (
+    UniqueConstraint(
+      "project_id",
+      "github_repository_id",
+      "identifier_type",
+      "identifier_value",
+      name="uq_github_incident_correlations_identifier",
+    ),
+    CheckConstraint(
+      "identifier_type IN ('workflow_run', 'commit')",
+      name="ck_github_incident_correlations_identifier_type",
+    ),
+    CheckConstraint(
+      "length(identifier_value) > 0",
+      name="ck_github_incident_correlations_identifier_value",
+    ),
+  )
+
+  id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    primary_key=True,
+    default=uuid.uuid4,
+  )
+  project_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("projects.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  github_repository_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("github_repositories.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  identifier_type: Mapped[str] = mapped_column(String(16), nullable=False)
+  identifier_value: Mapped[str] = mapped_column(String(128), nullable=False)
+  incident_id: Mapped[uuid.UUID] = mapped_column(
+    Uuid(as_uuid=True),
+    ForeignKey("incidents.id", ondelete="CASCADE"),
+    nullable=False,
+    index=True,
+  )
+  created_at: Mapped[datetime] = mapped_column(
     DateTime(timezone=True),
     server_default=func.now(),
     nullable=False,

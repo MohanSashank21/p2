@@ -54,6 +54,7 @@ class ToolDescriptor(BaseModel):
   name: str
   description: str
   input_schema: dict[str, Any]
+  output_schema: dict[str, Any]
   read_only: bool = Field(
     description=(
       "True when the tool performs no provider-side mutations; it may still "
@@ -76,5 +77,5 @@ class ToolDefinition(Generic[InputT]):
   description: str
   input_model: type[InputT]
   handler: Callable[[ToolContext, InputT], Awaitable[ToolResult]]
-  read_only: bool = True
+  read_only: bool = False
   persists_evidence: bool = False

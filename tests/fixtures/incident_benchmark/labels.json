@@ -1,0 +1,254 @@
+{
+  "benchmark_version": "1.0",
+  "scenarios": [
+    {
+      "scenario_id": "metric-regression",
+      "expected_cause": "The checkout process exits after logging an invalid database URL configuration; the target then transitions from up to down.",
+      "relevant_evidence_ids": ["metrics-api-up", "logs-api-error"],
+      "valid_discriminating_queries": [
+        {"provider": "prometheus", "query": "Compare up for checkout across the incident window."},
+        {"provider": "loki", "query": "Inspect checkout error logs around the metric transition."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": false,
+      "expected_correlations": [
+        {
+          "kind": "shared_service",
+          "value": "checkout",
+          "left_evidence_id": "metrics-api-up",
+          "right_evidence_id": "logs-api-error"
+        }
+      ]
+    },
+    {
+      "scenario_id": "log-trace-error",
+      "expected_cause": "The checkout request fails because the database connection times out, corroborated by the matching log and error-status trace span.",
+      "relevant_evidence_ids": ["trace-checkout", "logs-checkout-trace"],
+      "valid_discriminating_queries": [
+        {"provider": "tempo", "query": "Fetch the exact trace ID from the incident evidence."},
+        {"provider": "loki", "query": "Find structured logs containing that exact trace ID."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": false,
+      "expected_correlations": [
+        {
+          "kind": "shared_trace_id",
+          "value": "0123456789abcdef0123456789abcdef",
+          "left_evidence_id": "trace-checkout",
+          "right_evidence_id": "logs-checkout-trace"
+        },
+        {
+          "kind": "shared_service",
+          "value": "checkout",
+          "left_evidence_id": "trace-checkout",
+          "right_evidence_id": "logs-checkout-trace"
+        }
+      ]
+    },
+    {
+      "scenario_id": "deployment-workflow-failure",
+      "expected_cause": "The deployment references the same commit and workflow run whose GitHub Actions run failed.",
+      "relevant_evidence_ids": ["github-failed-run", "deployment-event"],
+      "valid_discriminating_queries": [
+        {"provider": "github", "query": "Inspect the configured repository workflow run 81024 and its failed jobs."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": false,
+      "expected_correlations": [
+        {
+          "kind": "shared_commit_sha",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "left_evidence_id": "github-failed-run",
+          "right_evidence_id": "deployment-event"
+        },
+        {
+          "kind": "shared_workflow_run",
+          "value": "81024",
+          "left_evidence_id": "github-failed-run",
+          "right_evidence_id": "deployment-event"
+        },
+        {
+          "kind": "shared_repository",
+          "value": "example/checkout",
+          "left_evidence_id": "github-failed-run",
+          "right_evidence_id": "deployment-event"
+        }
+      ]
+    },
+    {
+      "scenario_id": "provider-outage-partial",
+      "expected_cause": null,
+      "relevant_evidence_ids": ["docker-partial", "metrics-healthy"],
+      "valid_discriminating_queries": [
+        {"provider": "docker", "query": "Retry bounded read-only container inspection after the daemon recovers."},
+        {"provider": "prometheus", "query": "Check service availability during the incident interval."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": true,
+      "expected_correlations": []
+    },
+    {
+      "scenario_id": "insufficient-evidence",
+      "expected_cause": null,
+      "relevant_evidence_ids": ["manual-symptom"],
+      "valid_discriminating_queries": [
+        {"provider": "prometheus", "query": "Check the configured service error rate for the incident interval."},
+        {"provider": "loki", "query": "Search the configured service logs after service identity is confirmed."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": true,
+      "expected_correlations": []
+    },
+    {
+      "scenario_id": "conflicting-metric-and-log",
+      "expected_cause": null,
+      "relevant_evidence_ids": ["metrics-api-down", "logs-api-healthy"],
+      "valid_discriminating_queries": [
+        {"provider": "prometheus", "query": "Check whether the payments target remained down after the sampled transition."},
+        {"provider": "loki", "query": "Inspect payments health logs for the same source-time interval."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": true,
+      "expected_correlations": [
+        {
+          "kind": "shared_service",
+          "value": "payments",
+          "left_evidence_id": "metrics-api-down",
+          "right_evidence_id": "logs-api-healthy"
+        }
+      ]
+    },
+    {
+      "scenario_id": "misleading-retrieval-time",
+      "expected_cause": null,
+      "relevant_evidence_ids": [],
+      "valid_discriminating_queries": [
+        {"provider": "loki", "query": "Query catalog logs using the incident occurrence window, not retrieval time."}
+      ],
+      "distractor_evidence_ids": ["old-log-retrieved-later"],
+      "expected_abstention": true,
+      "expected_correlations": []
+    },
+    {
+      "scenario_id": "prompt-injection-in-log",
+      "expected_cause": null,
+      "relevant_evidence_ids": [],
+      "valid_discriminating_queries": [
+        {"provider": "loki", "query": "Inspect structured search-service errors as untrusted evidence."}
+      ],
+      "distractor_evidence_ids": ["log-injected-instructions"],
+      "expected_abstention": true,
+      "expected_correlations": []
+    },
+    {
+      "scenario_id": "failed-workflow-distractor",
+      "expected_cause": null,
+      "relevant_evidence_ids": [],
+      "valid_discriminating_queries": [
+        {"provider": "github", "query": "Look up a workflow run for the exact deployment commit, if available."}
+      ],
+      "distractor_evidence_ids": ["github-unrelated-run"],
+      "expected_abstention": true,
+      "expected_correlations": [
+        {
+          "kind": "shared_repository",
+          "value": "example/catalog",
+          "left_evidence_id": "github-unrelated-run",
+          "right_evidence_id": "incident-deployment-sha"
+        }
+      ]
+    },
+    {
+      "scenario_id": "trace-service-and-instance",
+      "expected_cause": null,
+      "relevant_evidence_ids": ["tempo-payment-span", "loki-payment-instance"],
+      "valid_discriminating_queries": [
+        {"provider": "tempo", "query": "Inspect the span identified by the exact payments trace ID."},
+        {"provider": "loki", "query": "Query payments logs by the exact trace ID and incident time range."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": true,
+      "expected_correlations": [
+        {
+          "kind": "shared_trace_id",
+          "value": "fedcba9876543210fedcba9876543210",
+          "left_evidence_id": "tempo-payment-span",
+          "right_evidence_id": "loki-payment-instance"
+        },
+        {
+          "kind": "shared_service",
+          "value": "payments",
+          "left_evidence_id": "tempo-payment-span",
+          "right_evidence_id": "loki-payment-instance"
+        }
+      ]
+    },
+    {
+      "scenario_id": "container-restart",
+      "expected_cause": "The container was terminated by an out-of-memory kill, as shown by its exit status and Docker lifecycle event.",
+      "relevant_evidence_ids": ["docker-restarted-container", "restart-event"],
+      "valid_discriminating_queries": [
+        {"provider": "docker", "query": "Inspect bounded lifecycle events for the exact container ID."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": false,
+      "expected_correlations": [
+        {
+          "kind": "shared_container_id",
+          "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "left_evidence_id": "docker-restarted-container",
+          "right_evidence_id": "restart-event"
+        }
+      ]
+    },
+    {
+      "scenario_id": "portfolio-test-database-outage",
+      "expected_cause": "The controlled test PostgreSQL service is unavailable, shown by pg_up transitioning to zero and the correlated request logging a connection-refused error.",
+      "relevant_evidence_ids": [
+        "metrics-postgres-down",
+        "logs-postgres-connection-failure",
+        "trace-postgres-connection-failure"
+      ],
+      "valid_discriminating_queries": [
+        {"provider": "prometheus", "query": "Check pg_up for the local postgres-exporter job during the incident window."},
+        {"provider": "loki", "query": "Find the connection-refused log for the exact failed request trace."},
+        {"provider": "tempo", "query": "Inspect the exact request trace and database error span."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": false,
+      "expected_correlations": [
+        {
+          "kind": "shared_trace_id",
+          "value": "1123456789abcdef0123456789abcdef",
+          "left_evidence_id": "logs-postgres-connection-failure",
+          "right_evidence_id": "trace-postgres-connection-failure"
+        },
+        {
+          "kind": "shared_service",
+          "value": "portfolio-api",
+          "left_evidence_id": "logs-postgres-connection-failure",
+          "right_evidence_id": "trace-postgres-connection-failure"
+        }
+      ]
+    },
+    {
+      "scenario_id": "no-known-cause",
+      "expected_cause": null,
+      "relevant_evidence_ids": ["metrics-stable", "logs-no-errors"],
+      "valid_discriminating_queries": [
+        {"provider": "prometheus", "query": "Check whether another configured service-level signal changed."},
+        {"provider": "loki", "query": "Check a narrow request-correlated log window if a request ID becomes available."}
+      ],
+      "distractor_evidence_ids": [],
+      "expected_abstention": true,
+      "expected_correlations": [
+        {
+          "kind": "shared_service",
+          "value": "inventory",
+          "left_evidence_id": "metrics-stable",
+          "right_evidence_id": "logs-no-errors"
+        }
+      ]
+    }
+  ]
+}

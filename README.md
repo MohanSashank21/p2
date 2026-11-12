@@ -255,6 +255,46 @@ evidence deduplication still apply. The schema migration that adds
 `investigation_runs` must be applied with `alembic upgrade head` before using
 these endpoints.
 
+## User-triggered AI evidence synthesis (Stage 1)
+
+AI synthesis is a separate, explicit action on a completed M5 run. It does not
+start automatically and does not let Gemini choose tools or query connected
+providers.
+
+Configure `GEMINI_API_KEY` in the API process environment or local `.env`, then
+set `GEMINI_SYNTHESIS_ENABLED=true` to enable the endpoint. Synthesis is
+disabled by default. Apply the migration with `alembic upgrade head` before
+using this feature.
+
+1. Complete a normal `POST /projects/{project_id}/incidents/{incident_id}/investigate`
+   and retain the `X-Investigation-Run-ID`.
+2. Explicitly request synthesis:
+   `POST /projects/{project_id}/incidents/{incident_id}/investigation-runs/{run_id}/synthesis`.
+3. Read the stored report/status with
+   `GET /projects/{project_id}/incidents/{incident_id}/investigation-runs/{run_id}/synthesis`.
+
+The API sends only evidence IDs recorded on that run, bounded M4 timeline and
+exact-identifier correlations, incident summary fields, and normalized
+evidence. It excludes original evidence payloads and source authentication
+credentials. Common credential patterns and sensitive field names in
+evidence are redacted, but this is not a complete DLP guarantee. Oversized
+evidence fails explicitly rather than being silently truncated. Every report
+citation is checked against the run's evidence IDs; the report,
+model/prompt/schema versions, bounded token usage, and status are stored on
+the M5 run. Repeating a successful POST returns the stored report without
+another model request. Failed synthesis can be attempted again only up to
+the configured per-run limit; requests are also rate-limited by user and
+project. Each provider attempt has a hard 60-second wall-clock deadline that
+covers response streaming as well as connection/read timeouts.
+
+The selected Gemini unpaid tier may use prompts and outputs for product
+improvement or human review. The user approved this data-sharing policy for
+Stage 1, but the application cannot guarantee provider retention, residency,
+or a strict $0 bill. No successful live model response has yet been evaluated,
+so this feature is not a validated root-cause investigator. Treat output as
+untrusted suggestions for human review, not as established cause or executed
+action.
+
 Prometheus can be requested with either an instant query (`source_id`,
 `expression`, and optional `evaluation_time`) or a range query (`source_id`,
 `expression`, `start`, `end`, and `step_seconds`). Its bounded result is saved
@@ -561,6 +601,16 @@ workflow.
 
 ## GitHub App integration
 
+Configure the GitHub App in the API process environment with
+`GITHUB_APP_ID`, `GITHUB_APP_SLUG`, `GITHUB_APP_PRIVATE_KEY`, and
+`GITHUB_WEBHOOK_SECRET`. `GITHUB_APP_PRIVATE_KEY` may use literal `\n`
+sequences for PEM line breaks. Keep these values in a secret manager or local
+environment only; the private key and webhook secret are not stored in
+project/source records or passed to investigation tools. Set the App's
+repository permissions to read-only for **Actions**, **Contents**, and
+**Metadata**. The installation token is requested with those read-only
+permissions.
+
 GitHub repositories are authorized through a GitHub App installation, then
 explicitly connected to an OpsPilot project. Set the GitHub App's single
 webhook URL to a publicly reachable HTTPS URL ending in `/webhooks/github`.
@@ -574,26 +624,40 @@ includes the run, commit, branch, and log API references needed to investigate
 failures.
 
 GitHub sends subscribed events to this central endpoint. OpsPilot verifies the
-signature and stores relevant deliveries for every project that has connected
-that repository. It does not create repository-level GitHub webhooks or send
-GitHub comments, statuses, or notifications. A local development server needs
-a running public HTTPS tunnel; temporary quick-tunnel URLs stop working when the
-tunnel exits and are not suitable for a permanent webhook URL.
-The webhook body is limited to 1 MiB; oversized deliveries are rejected with
-HTTP 413 before JSON parsing.
+signature, requires GitHub's stable delivery ID, and durably queues relevant
+deliveries for every project that has connected that repository. A supervised
+database worker creates an incident and compact `github_workflow_event`
+evidence, or links the event to an existing incident only when repository plus
+workflow-run ID or full commit SHA maps to exactly one incident. Conflicting
+matches create a separate incident; time proximity is never used. Events
+received before this processing migration are not replayed automatically.
+The event list reports `pending`, `processing`, `retry`, `processed`, or
+`failed`, along with the attempt count, safe failure category, and linked
+incident ID. Retries are bounded and recover after a worker restart through
+expiring leases.
+
+The worker does not call GitHub or fetch logs, source files, or run details
+during intake. It persists only bounded identifiers and provenance from the
+signed payload; current workflow investigation context remains an explicit,
+on-demand API request. It does not create repository-level GitHub webhooks or
+send GitHub comments, statuses, or notifications. A local development server
+needs a running public HTTPS tunnel; temporary quick-tunnel URLs stop working
+when the tunnel exits and are not suitable for a permanent webhook URL. The
+webhook body is limited to 1 MiB; oversized deliveries are rejected with HTTP
+413 before JSON parsing.
 
 `GET /projects/{project_id}/github/repositories/{repository_id}/webhook-events`
 lists events already received and stored; an empty list means no matching
 delivery has been stored yet. This endpoint does not query GitHub's delivery
-history. Use
+history. Use the event's processing status and incident ID to follow
+asynchronous intake. Use
 `GET /projects/{project_id}/github/repositories/{repository_id}/webhook-events/{event_id}/investigation`
 to fetch a stored failed run's current GitHub run details, jobs, commit and
 changed-file patches and source contents (up to ten text files of at most 1 MiB
 each; binary, removed, and oversized files are identified as unavailable), the
 ten most recent commits up to the failing commit, and workflow logs. This
 investigation context is fetched on demand rather than stored or fetched for
-every webhook; log output and code-file retrieval are bounded. It does not
-create an incident automatically.
+every webhook; log output and code-file retrieval are bounded.
 
 To persist that context on an existing incident, first get the event ID from
 the webhook-events endpoint, then include its connected GitHub repository ID
@@ -601,17 +665,25 @@ and event ID in the `github` criteria of
 `POST /projects/{project_id}/incidents/{incident_id}/investigate`. The combined
 endpoint stores `github_context` evidence on that incident. The context
 endpoint can correlate it by exact workflow-run ID, commit SHA, or repository
-identity when other evidence contains the same identifier. GitHub evidence is
-never automatically attached to an incident, and time or generic labels alone
-are not used to infer a match.
+identity when other evidence contains the same identifier. The compact
+workflow-event evidence is automatically attached during intake; fetched GitHub
+investigation context is still attached only through the explicit investigation
+request. Event intake and incident linking do not use time or generic labels.
+Apply the current schema with `alembic upgrade head`; existing GitHub-context
+evidence is backfilled into the exact-identifier correlation index, but old
+unprocessed webhook deliveries are left untouched.
 
 ## Current scope
 
 The backend currently provides authentication, project-level ownership and
 membership, generic webhook event intake, Alertmanager and Grafana alert
 lifecycle intake, Loki log evidence retrieval, manual and webhook-created
-incidents, and persisted evidence. It does not yet
-run an AI investigation or remediation workflow. The
+incidents, persisted evidence, and caller-directed investigations across
+configured integrations. A feature-gated Gemini synthesis endpoint can produce
+a bounded report from evidence on a completed investigation run; it does not
+select tools or run an investigation loop. The feature is disabled by default.
+LangGraph, autonomous investigation, remediation, and a frontend are not
+implemented in this backend checkout. The
 migration removing the legacy organization and invitation schema refuses to
 run while records in those legacy tables remain; it preserves users, projects,
 project memberships, and environments. This migration is irreversible.

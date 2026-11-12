@@ -1064,10 +1064,12 @@ async def test_investigation_runs_are_persisted_idempotent_and_project_scoped(
     f"/projects/{project_id}/incidents/{incident_id}/investigation-runs",
     headers=_headers(owner),
   )
-  assert [item["status"] for item in retried_history.json()] == [
-    "partial",
-    "succeeded",
-  ]
+  statuses_by_run_id = {
+    item["id"]: item["status"]
+    for item in retried_history.json()
+  }
+  assert statuses_by_run_id[first.headers["X-Investigation-Run-ID"]] == "succeeded"
+  assert statuses_by_run_id[retried.headers["X-Investigation-Run-ID"]] == "partial"
 
 
 @pytest.mark.asyncio

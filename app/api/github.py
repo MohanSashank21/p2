@@ -6,6 +6,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from redis.asyncio import Redis
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import get_current_user
@@ -145,6 +146,10 @@ def _webhook_event_response(event: GitHubWebhookEvent) -> GitHubWebhookEventResp
     delivery_id=event.delivery_id,
     event_name=event.event_name,
     action=event.action,
+    incident_id=str(event.incident_id) if event.incident_id else None,
+    processing_status=event.processing_status,
+    attempt_count=event.attempt_count,
+    last_failure_code=event.last_failure_code,
     payload=event.payload,
     received_at=event.received_at,
   )
@@ -467,7 +472,11 @@ async def receive_github_webhook(
     return GitHubWebhookResponse(accepted=False, duplicate=False, stored_count=0, ignored_reason="No repository metadata found")
 
   github_repo_id = repository.get("id")
-  if not isinstance(github_repo_id, int):
+  if (
+    not isinstance(github_repo_id, int)
+    or isinstance(github_repo_id, bool)
+    or github_repo_id <= 0
+  ):
     return GitHubWebhookResponse(accepted=False, duplicate=False, stored_count=0, ignored_reason="Repository metadata was missing")
 
   repositories = await session.scalars(
@@ -485,7 +494,17 @@ async def receive_github_webhook(
       ignored_reason="No connected repository found for this GitHub repository",
     )
 
-  delivery_id = request.headers.get("x-github-delivery") or str(uuid.uuid4())
+  delivery_id = request.headers.get("x-github-delivery")
+  if (
+    not delivery_id
+    or delivery_id != delivery_id.strip()
+    or len(delivery_id) > 255
+    or any(not character.isprintable() for character in delivery_id)
+  ):
+    raise HTTPException(
+      status_code=400,
+      detail="A valid X-GitHub-Delivery header is required",
+    )
   project_ids = [repo.project_id for repo in connected_repositories]
   existing_events = await session.scalars(
     select(GitHubWebhookEvent).where(
@@ -494,8 +513,11 @@ async def receive_github_webhook(
     ),
   )
   existing_project_ids = {event.project_id for event in existing_events}
-  new_events = [
-    GitHubWebhookEvent(
+  new_events: list[GitHubWebhookEvent] = []
+  for repo in connected_repositories:
+    if repo.project_id in existing_project_ids:
+      continue
+    event = GitHubWebhookEvent(
       project_id=repo.project_id,
       github_repository_id=repo.id,
       delivery_id=delivery_id,
@@ -507,9 +529,22 @@ async def receive_github_webhook(
       ),
       payload=payload,
     )
-    for repo in connected_repositories
-    if repo.project_id not in existing_project_ids
-  ]
+    try:
+      async with session.begin_nested():
+        session.add(event)
+        await session.flush()
+    except IntegrityError:
+      duplicate_id = await session.scalar(
+        select(GitHubWebhookEvent.id).where(
+          GitHubWebhookEvent.project_id == repo.project_id,
+          GitHubWebhookEvent.delivery_id == delivery_id,
+        ),
+      )
+      if duplicate_id is None:
+        raise
+      existing_project_ids.add(repo.project_id)
+      continue
+    new_events.append(event)
   if not new_events:
     return GitHubWebhookResponse(accepted=True, duplicate=True, stored_count=0)
 

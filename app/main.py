@@ -1,4 +1,4 @@
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 import asyncio
 
 from fastapi import FastAPI, Request
@@ -12,6 +12,9 @@ from app.core.config import settings
 from app.db.database import AsyncSessionLocal, check_database_connection, engine
 from app.api.router import api_router
 from app.services.github_event_worker import run_github_event_worker
+from app.services.investigation_checkpointer import (
+  open_postgres_investigation_checkpointer,
+)
 from app.utils.jwt import validate_auth_token_configuration
 
 @asynccontextmanager
@@ -33,10 +36,25 @@ async def lifespan(app: FastAPI):
   try:
     await redis_client.ping()
     await check_database_connection()
-    worker_task = asyncio.create_task(
-      run_github_event_worker(AsyncSessionLocal),
-    )
-    yield
+    async with AsyncExitStack() as stack:
+      if settings.AI_INVESTIGATION_ENABLED:
+        app.state.investigation_checkpointer = await stack.enter_async_context(
+          open_postgres_investigation_checkpointer(settings.DATABASE_URL),
+        )
+      worker_task = asyncio.create_task(
+        run_github_event_worker(AsyncSessionLocal),
+      )
+      try:
+        yield
+      finally:
+        if worker_task is not None:
+          worker_task.cancel()
+          try:
+            await worker_task
+          except asyncio.CancelledError:
+            pass
+        if settings.AI_INVESTIGATION_ENABLED:
+          del app.state.investigation_checkpointer
   except RedisError:
     raise RuntimeError(
       "Redis is unavailable; authentication state cannot be secured",
@@ -44,12 +62,6 @@ async def lifespan(app: FastAPI):
   except SQLAlchemyError:
     raise RuntimeError("PostgreSQL is unavailable") from None
   finally:
-    if worker_task is not None:
-      worker_task.cancel()
-      try:
-        await worker_task
-      except asyncio.CancelledError:
-        pass
     try:
       await redis_client.aclose()
     finally:

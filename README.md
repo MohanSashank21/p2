@@ -8,8 +8,7 @@ migrations before starting the API:
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-docker run --name opspilot-redis -p 6379:6379 -d redis:7-alpine
+test -f .env || cp .env.example .env
 alembic upgrade head
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
@@ -28,6 +27,41 @@ Generate each signing/pepper secret independently with:
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
+## Run the API with Docker Desktop
+
+The root `docker-compose.yml` runs the OpsPilot API with local Prometheus,
+Loki, Tempo, and Grafana services. PostgreSQL and Redis remain the services
+configured on the host; the API container routes local database/cache URLs
+through `host.docker.internal`. The API and observability UIs are published
+only on loopback. The Compose setup does not define or mount a PostgreSQL
+volume; new observability volumes persist their own data.
+
+After configuring the project `.env` and confirming its `DATABASE_URL` points
+to the intended database, build and start the API with:
+
+```sh
+docker compose up --build -d
+docker compose ps
+```
+
+Check readiness at `http://127.0.0.1:8000/health/ready`. Apply schema updates
+separately and deliberately:
+
+```sh
+docker compose run --rm opspilot-api alembic upgrade head
+```
+
+Review pending migrations and preserve a database backup before applying
+them. Stop the API without removing data using `docker compose stop`.
+
+Local service URLs are Grafana `http://127.0.0.1:3000`, Prometheus
+`http://127.0.0.1:9090`, Loki `http://127.0.0.1:3100`, and Tempo
+`http://127.0.0.1:3200` (OTLP/HTTP receiver `http://127.0.0.1:4318`). Grafana
+is configured for anonymous Viewer access and is bound to loopback only.
+Prometheus probes the API readiness endpoint through Blackbox Exporter.
+Grafana has Prometheus, Loki, and Tempo data sources provisioned; the API does
+not currently push logs to Loki or export traces to Tempo.
+
 For Loki connections, set `LOKI_ALLOWED_HOSTS` to a comma-separated exact
 host allowlist (include `:port` when using a non-default port). Generate and
 keep `LOKI_CREDENTIAL_ENCRYPTION_KEY` stable and backed up; it encrypts Loki
@@ -44,9 +78,11 @@ or basic authentication. Authenticated Loki sources require the encryption key.
 ## Read-only Docker investigation
 
 Docker integration inspects the Docker daemon available to the OpsPilot API
-process. It does not expose a Docker proxy, manage hosted Docker services, or
-receive telemetry. Configure the local daemon endpoint in the API process
-environment; Docker endpoints are not stored in source records.
+process. In the root Docker Compose setup, the API receives the Docker Desktop
+Unix socket at `/var/run/docker.sock`, so it can inspect the API, Loki,
+Prometheus, Grafana, Tempo, and other containers on that same Docker Desktop
+daemon. It does not expose a Docker proxy, manage hosted Docker services, or
+receive telemetry. Docker endpoints are not stored in source records.
 
 Set `DOCKER_HOST` only when the process's default endpoint is not correct. Use
 the local Unix socket shown by your Docker Engine/Desktop setup, for example
@@ -57,11 +93,13 @@ loopback TCP. Do not expose the Docker daemon or socket over a network.
 `DOCKER_QUERY_TIMEOUT_SECONDS` bounds individual daemon requests; Docker log
 output is capped by `DOCKER_LOG_MAX_BYTES`.
 
-Docker daemon access is highly privileged. Despite OpsPilot's strictly
-read-only API, a process that can access the daemon socket can often obtain
-host-level control through Docker itself. Restrict access to the API process
-and to trusted project members; do not make a local development daemon
-available to untrusted users.
+Docker daemon access is highly privileged. The Compose socket mount is marked
+read-only as a filesystem mount, but this does not make Docker API operations
+read-only; a process that can connect to the socket can often obtain host-level
+control through Docker itself. OpsPilot's current Docker service issues
+read-only inspection calls, but a compromise of the API container could use
+the socket more broadly. Run this only in a trusted local environment, keep
+the API bound to loopback, and do not expose it to untrusted users.
 
 Apply database migrations and restart the API after configuring its local
 daemon access. A project owner creates a source with

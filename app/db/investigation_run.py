@@ -91,6 +91,7 @@ class InvestigationRun(Base):
   )
   aggregate_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
   integration_results: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+  agent_report: Mapped[dict | None] = mapped_column(JSON, nullable=True)
   evidence_ids: Mapped[list[str]] = mapped_column(
     JSON,
     nullable=False,

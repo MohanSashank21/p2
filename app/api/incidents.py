@@ -161,6 +161,7 @@ def _investigation_run_response(
     status=run.status,
     aggregate_status=run.aggregate_status,
     integrations=run.integration_results,
+    agent_report=run.agent_report,
     evidence_ids=run.evidence_ids,
     failure_code=run.failure_code,
     failure_detail=run.failure_detail,

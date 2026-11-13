@@ -40,6 +40,7 @@ from app.db.redis import get_redis
 from app.db.user import User
 from app.main import app
 from app.services import github_project_service
+from app.services.investigation_run_service import fail_stale_investigation_runs
 from app.schemas.investigation_schema import IntegrationInvestigationResult
 from app.utils.jwt import create_access_token
 
@@ -1333,3 +1334,42 @@ async def test_stale_running_run_is_marked_interrupted(
   assert response.status_code == 200
   assert response.json()["status"] == "failed"
   assert response.json()["failure_code"] == "execution_interrupted"
+
+
+@pytest.mark.asyncio
+async def test_stale_agent_run_remains_available_for_checkpoint_recovery(
+  incident_client,
+):
+  client, session_factory = incident_client
+  owner = await _create_user(session_factory, "agent-run-owner")
+  project_id = await _create_project(client, owner, "Agent run recovery")
+  created_incident = await client.post(
+    f"/projects/{project_id}/incidents",
+    json={
+      "incident_type": "service_outage",
+      "title": "Recovery test incident",
+      "description": "Synthetic recovery scenario.",
+    },
+    headers=_headers(owner),
+  )
+  assert created_incident.status_code == 201
+  incident_id = uuid.UUID(created_incident.json()["id"])
+  run = InvestigationRun(
+    project_id=project_id,
+    incident_id=incident_id,
+    requested_by_user_id=owner.id,
+    request_hash="b" * 64,
+    requested_integrations=["investigation_graph"],
+    request_criteria={"mode": "bounded_ai_investigation"},
+    status="running",
+    started_at=datetime.now(UTC) - timedelta(hours=1),
+  )
+  async with session_factory() as session:
+    session.add(run)
+    await session.commit()
+    run_id = run.id
+    await fail_stale_investigation_runs(session, incident_id)
+    refreshed = await session.get(InvestigationRun, run_id)
+
+  assert refreshed is not None
+  assert refreshed.status == "running"

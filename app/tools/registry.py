@@ -42,6 +42,11 @@ class ToolRegistry:
       for tool in sorted(self._tools.values(), key=lambda item: item.name)
     ]
 
+  def get_tool_definitions(self) -> tuple[ToolDefinition[Any], ...]:
+    return tuple(
+      sorted(self._tools.values(), key=lambda item: item.name)
+    )
+
   async def execute(
     self,
     name: str,

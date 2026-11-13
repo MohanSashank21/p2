@@ -90,6 +90,7 @@ class InvestigationRunResponse(BaseModel):
   status: Literal["running", "succeeded", "partial", "failed", "cancelled"]
   aggregate_status: Literal["success", "partial", "unavailable"] | None
   integrations: dict[str, IntegrationInvestigationResult] | None
+  agent_report: dict | None = None
   evidence_ids: list[uuid.UUID]
   failure_code: str | None
   failure_detail: str | None

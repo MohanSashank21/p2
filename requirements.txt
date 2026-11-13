@@ -12,3 +12,6 @@ httpx
 python-dotenv
 cryptography
 docker>=7,<8
+langgraph>=1.0,<2.0
+langgraph-checkpoint-postgres>=3.0,<4.0
+psycopg[binary,pool]>=3.2,<4.0

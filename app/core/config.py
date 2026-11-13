@@ -42,6 +42,7 @@ class Settings(BaseSettings):
   GEMINI_MODEL: str = "gemini-2.5-flash"
   GEMINI_SYNTHESIS_ENABLED: bool = False
   GEMINI_SYNTHESIS_MAX_RUN_ATTEMPTS: int = Field(default=2, ge=1, le=3)
+  AI_INVESTIGATION_ENABLED: bool = False
   ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=15, ge=1, le=60)
   REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7, ge=1, le=90)
   OTP_EXPIRE_MINUTES: int = Field(default=5, ge=1, le=30)

@@ -3,7 +3,7 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,7 @@ from app.schemas.investigation_schema import (
   IntegrationInvestigationResult,
 )
 from app.schemas.incident_schema import IncidentEvidenceResponse
+from app.services.investigation_graph import InvestigationBudget
 
 RUN_TIMEOUT_SECONDS = 300
 STALE_RUN_TIMEOUT_SECONDS = RUN_TIMEOUT_SECONDS + 60
@@ -41,6 +42,73 @@ def _request_hash(request_data: dict) -> str:
   return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def _agent_request_data(
+  question: str,
+  budget: InvestigationBudget,
+) -> dict:
+  normalized_question = question.strip()
+  if not normalized_question or len(normalized_question) > 1000:
+    raise ValueError("Investigation question must contain 1-1000 characters.")
+  return {
+    "mode": "bounded_ai_investigation",
+    "question": normalized_question,
+    "budget": budget.model_dump(mode="json"),
+  }
+
+
+async def reserve_agent_investigation_run(
+  session: AsyncSession,
+  project_id: uuid.UUID,
+  incident_id: uuid.UUID,
+  user: User,
+  question: str,
+  budget: InvestigationBudget,
+  idempotency_key: str | None,
+) -> tuple[InvestigationRun, bool]:
+  await fail_stale_investigation_runs(session, incident_id)
+  request_data = _agent_request_data(question, budget)
+  request_hash = _request_hash(request_data)
+  lookup = select(InvestigationRun).where(
+    InvestigationRun.project_id == project_id,
+    InvestigationRun.incident_id == incident_id,
+    InvestigationRun.requested_by_user_id == user.id,
+    InvestigationRun.idempotency_key == idempotency_key,
+  )
+  if idempotency_key is not None:
+    existing = await session.scalar(lookup)
+    if existing is not None:
+      if existing.request_hash != request_hash:
+        raise IdempotencyKeyConflictError
+      return existing, False
+
+  run = InvestigationRun(
+    project_id=project_id,
+    incident_id=incident_id,
+    requested_by_user_id=user.id,
+    idempotency_key=idempotency_key,
+    request_hash=request_hash,
+    requested_integrations=["investigation_graph"],
+    request_criteria=request_data,
+    status="running",
+    attempt_count=1,
+  )
+  session.add(run)
+  try:
+    await session.commit()
+  except IntegrityError:
+    await session.rollback()
+    if idempotency_key is None:
+      raise
+    existing = await session.scalar(lookup)
+    if existing is None:
+      raise
+    if existing.request_hash != request_hash:
+      raise IdempotencyKeyConflictError
+    return existing, False
+  await session.refresh(run)
+  return run, True
+
+
 async def fail_stale_investigation_runs(
   session: AsyncSession,
   incident_id: uuid.UUID,
@@ -51,6 +119,11 @@ async def fail_stale_investigation_runs(
     .where(
       InvestigationRun.incident_id == incident_id,
       InvestigationRun.status == "running",
+      or_(
+        InvestigationRun.request_criteria["mode"].as_string().is_(None),
+        InvestigationRun.request_criteria["mode"].as_string()
+        != "bounded_ai_investigation",
+      ),
       InvestigationRun.started_at
       < now - timedelta(seconds=STALE_RUN_TIMEOUT_SECONDS),
     )
@@ -149,6 +222,64 @@ async def complete_investigation_run(
     "partial": "partial",
     "unavailable": "failed",
   }[aggregate_status]
+  run.completed_at = datetime.now(UTC)
+  await session.commit()
+  await session.refresh(run)
+  return run
+
+
+async def complete_agent_investigation_run(
+  session: AsyncSession,
+  run_id: uuid.UUID,
+  state: dict,
+) -> InvestigationRun:
+  run = await session.get(InvestigationRun, run_id)
+  if run is None:
+    raise RuntimeError("Investigation run disappeared before completion")
+  if run.status != "running":
+    raise RuntimeError("Only a running investigation run can be completed")
+  outcome = state.get("outcome")
+  status_by_outcome = {
+    "conclusion": ("succeeded", "success"),
+    "inconclusive": ("partial", "partial"),
+    "failed": ("failed", "unavailable"),
+  }
+  statuses = status_by_outcome.get(outcome)
+  if statuses is None:
+    raise ValueError("Investigation graph has no explicit terminal outcome")
+  run.status, run.aggregate_status = statuses
+  run.agent_report = {
+    "workflow": "langgraph_bounded_v1",
+    "outcome": outcome,
+    "claim": state.get("claim"),
+    "evidence_citations": state.get("evidence_citations", []),
+    "stop_reason": state.get("stop_reason"),
+    "budget_usage": {
+      "cycles": state.get("cycle_count", 0),
+      "model_calls": state.get("model_call_count", 0),
+      "model_tokens": (
+        state.get("model_tokens_consumed", 0)
+        + state.get("model_tokens_reserved", 0)
+      ),
+      "model_tokens_consumed": state.get("model_tokens_consumed", 0),
+      "model_tokens_reserved": state.get("model_tokens_reserved", 0),
+      "tool_calls": state.get("tool_call_count", 0),
+    },
+    "tool_failures": state.get("tool_failures", []),
+  }
+  run.evidence_ids = [
+    row["id"] for row in state.get("evidence", [])
+  ]
+  run.failure_code = (
+    str(state.get("stop_reason", "investigation_failed"))[:64]
+    if outcome == "failed"
+    else None
+  )
+  run.failure_detail = (
+    "The bounded investigation did not produce a verified result."
+    if outcome == "failed"
+    else None
+  )
   run.completed_at = datetime.now(UTC)
   await session.commit()
   await session.refresh(run)

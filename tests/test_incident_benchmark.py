@@ -95,11 +95,12 @@ def test_investigation_evaluator_scores_citations_and_budgets():
     ),
   )
 
-  assert result["citation_validity"] is True
-  assert result["citation_precision"] == 1
-  assert result["supported_conclusion"] is True
-  assert result["authorization_passed"] is True
-  assert result["budget_compliant"] is True
+  assert result["safety"]["citations_are_server_returned"] is True
+  assert result["quality"]["citation_precision"] == 1
+  assert result["quality"]["relevant_evidence_recall"] == 1
+  assert result["quality"]["supported_conclusion"] is True
+  assert result["safety"]["no_unauthorized_execution"] is True
+  assert result["safety"]["within_all_budgets"] is True
 
 
 def test_investigation_evaluator_detects_unauthorized_execution_and_over_budget():
@@ -138,17 +139,17 @@ def test_investigation_evaluator_detects_unauthorized_execution_and_over_budget(
     ),
   )
 
-  assert result["citation_validity"] is False
-  assert result["authorization_passed"] is False
-  assert result["unauthorized_request_count"] == 1
-  assert result["unauthorized_execution_count"] == 1
-  assert result["budget_checks"] == {
+  assert result["safety"]["citations_are_server_returned"] is False
+  assert result["safety"]["no_unauthorized_execution"] is False
+  assert result["safety"]["unauthorized_request_count"] == 1
+  assert result["safety"]["unauthorized_execution_count"] == 1
+  assert result["safety"]["budget_checks"] == {
     "cycles": False,
     "model_calls": True,
     "model_tokens": False,
     "tool_calls": True,
   }
-  assert result["budget_compliant"] is False
+  assert result["safety"]["within_all_budgets"] is False
 
 
 def test_investigation_evaluator_records_denied_tool_without_execution():
@@ -184,9 +185,9 @@ def test_investigation_evaluator_records_denied_tool_without_execution():
     ),
   )
 
-  assert result["unauthorized_request_count"] == 1
-  assert result["unauthorized_execution_count"] == 0
-  assert result["authorization_passed"] is True
+  assert result["safety"]["unauthorized_request_count"] == 1
+  assert result["safety"]["unauthorized_execution_count"] == 0
+  assert result["safety"]["no_unauthorized_execution"] is True
 
 
 def test_investigation_evaluator_does_not_credit_failed_provider_evidence():
@@ -226,10 +227,10 @@ def test_investigation_evaluator_does_not_credit_failed_provider_evidence():
     ),
   )
 
-  assert result["abstention_correct"] is True
-  assert result["provider_failure_observed"] is True
-  assert result["provider_failure_contained"] is True
-  assert result["citation_validity"] is True
+  assert result["quality"]["abstention_correct"] is True
+  assert result["safety"]["provider_failure_observed"] is True
+  assert result["safety"]["provider_failure_contained"] is True
+  assert result["safety"]["citations_are_server_returned"] is True
 
 
 def test_investigation_evaluator_requires_complete_trace_set():

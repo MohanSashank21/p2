@@ -1,0 +1,17 @@
+.env
+.env.*
+.git
+.gitignore
+.pytest_cache
+.venv
+myenv
+__pycache__
+*.py[cod]
+node_modules
+akmatori
+test-harness
+tests
+dataset
+docs
+README.md
+requirements-dev.txt

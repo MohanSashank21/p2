@@ -1,0 +1,22 @@
+apiVersion: 1
+
+datasources:
+  - name: OpsPilot Prometheus
+    uid: opspilot-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+  - name: OpsPilot Loki
+    uid: opspilot-loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
+  - name: OpsPilot Tempo
+    uid: opspilot-tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: true

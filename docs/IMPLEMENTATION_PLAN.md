@@ -33,8 +33,9 @@ The current backend includes:
 One live Gemini request using only the synthetic `metric-regression` fixture
 succeeded. This verifies a provider request, not report accuracy, the complete
 API persistence workflow, or production readiness. The synthesis feature
-defaults off. This checkout contains no LangGraph dependency, autonomous
-investigation loop, or frontend.
+defaults off. This checkout contains an internal LangGraph investigation
+prototype, but no production model adapter, public AI-investigation route, or
+frontend.
 
 ## Architecture and safety rules
 
@@ -154,10 +155,11 @@ row-lock test in the unrelated Alertmanager suite.
 
 ## Phase 3 — Investigation engine
 
-**Status: not implemented.** The current combined API is caller-directed and
-the current tool registry has no model-facing planner. The deterministic
-benchmark validates context projection only: it makes zero model/provider
-calls and does not measure root-cause accuracy.
+**Status: in progress.** A bounded LangGraph runtime, isolated deterministic
+tests, registry adapter, durable run reporting, and optional PostgreSQL
+checkpoint support are implemented. The runtime has no production model
+adapter or public start/resume endpoint, so it is not yet a user-facing
+AI-directed investigation feature.
 
 ### Recommended implementation order
 
@@ -192,10 +194,11 @@ LangGraph Agent Server or a microservice. See the [LangGraph workflows and
 agents guide](https://docs.langchain.com/oss/python/langgraph/workflows-agents)
 and [persistence guide](https://docs.langchain.com/oss/python/langgraph/persistence).
 
-**Gate:** held-out synthetic evaluation meets the agreed accuracy,
-abstention, citation, authorization, failure-containment, and hard-budget
-thresholds; tests prove no unapproved tool can execute and repeated calls
-terminate within limits. Do not claim autonomous RCA before this gate passes.
+**Gate:** safety invariants pass 100% of deterministic tests; held-out
+investigation-quality metrics meet agreed thresholds; tests prove no
+unapproved tool can execute and repeated calls terminate within limits. Root
+cause accuracy still requires human adjudication. Do not claim autonomous RCA
+before this gate passes.
 
 ### Phase 3 progress
 
@@ -208,10 +211,54 @@ Its inputs separate visible synthetic scenarios from scoring labels.
 Root-cause accuracy remains unset and requires human adjudication; these
 fixtures are not a model-quality result.
 
-This is only the benchmark contract and scorer. It does not execute a model,
-tools, or an investigation graph; tests use synthetic traces, and no live
-provider request is made. The bounded investigation runtime and its own
-authorization/budget enforcement remain unimplemented.
+The evaluator contract separates **safety invariants** (server-returned
+citations, no unauthorized execution, failed-provider evidence containment,
+and centralized budget compliance) from **investigation-quality metrics**
+(abstention accuracy, citation precision, relevant-evidence recall, and
+supported-conclusion rate). Safety is a hard 100% gate across deterministic
+tests; quality metrics are reported independently and are not represented as
+LLM reasoning accuracy. Root-cause accuracy remains unset pending human
+adjudication.
+
+The evaluator does not call a model or tools; scripted traces are test inputs,
+not evidence of LLM reasoning quality. No live provider request was made.
+
+The bounded graph uses a deterministic injected model interface, one
+application-validated read-only tool action per cycle, a shared server-side
+budget, server-persisted evidence IDs, and a fail-closed conclusion contract.
+Retries are not configured. Checkpoint state pins the budget and tool schemas;
+resume refuses to replay an interrupted model or tool operation. Fake tools
+exist only in tests. Production bindings are created from `ToolRegistry`,
+re-query persisted evidence within incident scope, and sanitize evidence using
+the existing synthesis redactor. `InvestigationRun.agent_report` stores the
+terminal outcome and budget usage.
+
+`AI_INVESTIGATION_ENABLED` defaults to false. When enabled it initializes the
+PostgreSQL checkpointer; it does not enable a model provider or expose an API
+route. The run service is internal and requires an injected model and
+checkpointer. No live Gemini calls or mutating tools are enabled. The
+`agent_report` migration has been added but has not been applied to any
+database.
+
+Token budgets reserve a server-counted input and bounded output allowance
+before each provider call, then reconcile the provider-reported input and
+output usage. Actual usage is accumulated across calls; uncompleted calls keep
+their reservation conservatively, and usage exceeding its reservation fails
+the run closed. This is only an enforceable provider token budget when the
+eventual provider adapter returns trustworthy usage and the preflight counter
+matches provider accounting. No production model adapter is present, so this
+contract is currently verified only with deterministic scripted models.
+The counters currently live in checkpointed graph state, not an atomic
+database ledger shared across concurrent workers. Concurrent duplicate
+execution of one run is therefore not yet certified as budget-safe.
+
+**Remaining before user-facing activation:** implement an explicitly approved
+model adapter and API, verify its preflight and reported token accounting,
+implement an atomic run-level budget ledger, test production PostgreSQL
+checkpoint setup/recovery on a disposable database, set quality thresholds on
+a held-out dataset, and define checkpoint retention. Until those gates pass,
+do not enable AI-directed runs in production or describe scripted metrics as
+LLM accuracy.
 
 ## Phase 4 — Knowledge and memory
 

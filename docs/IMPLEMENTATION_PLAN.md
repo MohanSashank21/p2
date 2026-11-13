@@ -197,6 +197,22 @@ abstention, citation, authorization, failure-containment, and hard-budget
 thresholds; tests prove no unapproved tool can execute and repeated calls
 terminate within limits. Do not claim autonomous RCA before this gate passes.
 
+### Phase 3 progress
+
+The first evaluator increment is implemented in
+`scripts/investigation_benchmark.py`: a strict trace/outcome schema and a
+provider-independent scorer for evidence provenance, relevant citations,
+abstention, denied tool requests versus unauthorized executions,
+provider-failure containment, and observed cycle/model/token/tool-call budgets.
+Its inputs separate visible synthetic scenarios from scoring labels.
+Root-cause accuracy remains unset and requires human adjudication; these
+fixtures are not a model-quality result.
+
+This is only the benchmark contract and scorer. It does not execute a model,
+tools, or an investigation graph; tests use synthetic traces, and no live
+provider request is made. The bounded investigation runtime and its own
+authorization/budget enforcement remain unimplemented.
+
 ## Phase 4 — Knowledge and memory
 
 **Status: not implemented.** Add project-scoped repository documentation,

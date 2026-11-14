@@ -109,7 +109,7 @@ class IncidentEvidence(Base):
       "evidence_type IN ('manual_report', 'webhook_payload', "
       "'alertmanager_notification', 'grafana_notification', 'loki_logs', "
       "'github_context', 'trace_spans', 'docker_investigation', "
-      "'prometheus_metrics', 'github_workflow_event')",
+      "'prometheus_metrics', 'github_workflow_event', 'web_search')",
       name="ck_incident_evidence_type",
     ),
     UniqueConstraint(
@@ -137,6 +137,18 @@ class IncidentEvidence(Base):
       ),
       sqlite_where=text(
         "evidence_type = 'github_context' AND query_hash IS NOT NULL",
+      ),
+    ),
+    Index(
+      "uq_incident_evidence_web_search_query",
+      "incident_id",
+      "query_hash",
+      unique=True,
+      postgresql_where=text(
+        "evidence_type = 'web_search' AND query_hash IS NOT NULL",
+      ),
+      sqlite_where=text(
+        "evidence_type = 'web_search' AND query_hash IS NOT NULL",
       ),
     ),
   )

@@ -63,6 +63,15 @@ Grafana has Prometheus, Loki, and Tempo data sources provisioned. The API
 exports FastAPI request spans and GitHub workflow-processing spans through the
 OpenTelemetry Collector to Tempo. The API does not currently push logs to Loki.
 
+Prometheus scrapes API request counts and latency from the API's internal
+`opspilot-api:8001/metrics` endpoint. That port is not published to the host or
+the public tunnel. Prometheus alert rules cover API scrape availability,
+readiness, elevated 5xx rates, and high p95 latency. Alertmanager is available
+at `http://127.0.0.1:9093`; in this local Compose setup it routes notifications
+only to an in-memory test receiver on the internal Docker network. It does not
+send email, chat, pages, or create OpsPilot incidents. Configure a real
+receiver separately before relying on alerts outside local testing.
+
 For Loki connections, set `LOKI_ALLOWED_HOSTS` to a comma-separated exact
 host allowlist (include `:port` when using a non-default port). Generate and
 keep `LOKI_CREDENTIAL_ENCRYPTION_KEY` stable and backed up; it encrypts Loki
@@ -339,6 +348,30 @@ or a strict $0 bill. No successful live model response has yet been evaluated,
 so this feature is not a validated root-cause investigator. Treat output as
 untrusted suggestions for human review, not as established cause or executed
 action.
+
+## Operator-triggered internet search
+
+OpsPilot can retrieve current public-web context for an incident through
+Gemini's Google Search grounding. It is an explicit, read-only operator action;
+it does not run automatically and does not resolve or modify an incident.
+The query and provider-generated summary are stored as `web_search` incident
+evidence with validated HTTP(S) source links, and are marked untrusted for
+later investigation or synthesis.
+
+Set `GEMINI_API_KEY` and explicitly enable `GEMINI_WEB_SEARCH_ENABLED=true`.
+Internet search is disabled by default. Apply the evidence-type migration with
+`alembic upgrade head`, then call:
+
+```text
+POST /projects/{project_id}/incidents/{incident_id}/internet-search
+{"query": "public service name error message version"}
+```
+
+Queries are limited to 512 characters, obvious credential assignments are
+rejected, requests are bounded to 30 seconds, and each user is limited to 10
+searches per project per minute. This is not a complete DLP guarantee: only
+submit public information that is appropriate to send to Google. Search
+summaries and source pages are untrusted evidence, not proof of cause.
 
 Prometheus can be requested with either an instant query (`source_id`,
 `expression`, and optional `evaluation_time`) or a range query (`source_id`,
@@ -723,12 +756,14 @@ unprocessed webhook deliveries are left untouched.
 The backend currently provides authentication, project-level ownership and
 membership, generic webhook event intake, Alertmanager and Grafana alert
 lifecycle intake, Loki log evidence retrieval, manual and webhook-created
-incidents, persisted evidence, and caller-directed investigations across
-configured integrations. A feature-gated Gemini synthesis endpoint can produce
-a bounded report from evidence on a completed investigation run; it does not
-select tools or run an investigation loop. The feature is disabled by default.
-LangGraph, autonomous investigation, remediation, and a frontend are not
-implemented in this backend checkout. The
+incidents, persisted evidence, operator-triggered grounded internet search,
+and caller-directed investigations across configured integrations. A
+feature-gated Gemini synthesis endpoint can produce a bounded report from
+evidence on a completed investigation run; it does not select tools or run an
+investigation loop. An internal LangGraph investigation prototype exists, but
+there is not yet a production model adapter or public AI-investigation route.
+Autonomous investigation, remediation, and a frontend are not implemented in
+this backend checkout. The
 migration removing the legacy organization and invitation schema refuses to
 run while records in those legacy tables remain; it preserves users, projects,
 project memberships, and environments. This migration is irreversible.

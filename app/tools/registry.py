@@ -3,6 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from app.core.config import settings
 from app.services.incident_service import get_project_incident
 from app.tools.contracts import (
   ToolContext,
@@ -82,6 +83,7 @@ def create_tool_registry() -> ToolRegistry:
   from app.tools.docker import investigate_incident_container_tool
   from app.tools.github import investigate_github_workflow_tool
   from app.tools.incident_evidence import read_incident_evidence_tool
+  from app.tools.internet_search import internet_search_tool
   from app.tools.loki import query_incident_logs_tool
   from app.tools.prometheus import (
     query_prometheus_instant_tool,
@@ -89,14 +91,15 @@ def create_tool_registry() -> ToolRegistry:
   )
   from app.tools.tempo import query_incident_traces_tool
 
-  return ToolRegistry(
-    (
-      investigate_incident_container_tool,
-      investigate_github_workflow_tool,
-      read_incident_evidence_tool,
-      query_incident_logs_tool,
-      query_prometheus_instant_tool,
-      query_prometheus_range_tool,
-      query_incident_traces_tool,
-    ),
-  )
+  tools = [
+    investigate_incident_container_tool,
+    investigate_github_workflow_tool,
+    read_incident_evidence_tool,
+    query_incident_logs_tool,
+    query_prometheus_instant_tool,
+    query_prometheus_range_tool,
+    query_incident_traces_tool,
+  ]
+  if settings.GEMINI_WEB_SEARCH_ENABLED:
+    tools.append(internet_search_tool)
+  return ToolRegistry(tools)

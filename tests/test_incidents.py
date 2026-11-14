@@ -12,7 +12,9 @@ os.environ.setdefault("OTP_HASH_SECRET_KEY", "test-otp-hmac-secret-not-for-produ
 
 import pytest
 import pytest_asyncio
+import httpx
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
 from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -38,8 +40,10 @@ from app.db.github import (
 from app.db.project_membership import ProjectMembership
 from app.db.redis import get_redis
 from app.db.user import User
+from app.core.config import settings
 from app.main import app
 from app.services import github_project_service
+from app.services import gemini_web_search_service
 from app.services.investigation_run_service import fail_stale_investigation_runs
 from app.schemas.investigation_schema import IntegrationInvestigationResult
 from app.utils.jwt import create_access_token
@@ -209,6 +213,112 @@ async def test_project_member_can_report_incident_and_read_its_evidence(
   assert saved is not None
   assert saved.source_event_id is None
   assert len(saved_evidence) == 1
+
+
+@pytest.mark.asyncio
+async def test_authorized_incident_member_can_search_and_persist_grounded_web_evidence(
+  incident_client,
+  monkeypatch,
+):
+  client, session_factory = incident_client
+  owner = await _create_user(session_factory, "web-search-owner")
+  project_id = await _create_project(client, owner, "Web Search Project")
+  created = await client.post(
+    f"/projects/{project_id}/incidents",
+    json={
+      "incident_type": "service_outage",
+      "title": "Synthetic timeout incident",
+      "description": "A test-only public error message.",
+      "severity": "high",
+    },
+    headers=_headers(owner),
+  )
+  assert created.status_code == 201
+  incident_id = created.json()["id"]
+
+  monkeypatch.setattr(settings, "GEMINI_WEB_SEARCH_ENABLED", True)
+  monkeypatch.setattr(settings, "GEMINI_API_KEY", SecretStr("synthetic-api-key"))
+
+  async def provider_handler(request: httpx.Request) -> httpx.Response:
+    assert request.headers["x-goog-api-key"] == "synthetic-api-key"
+    return httpx.Response(
+      200,
+      json={
+        "candidates": [{
+          "finishReason": "STOP",
+          "content": {
+            "parts": [{"text": "A public release note documents the fix."}],
+          },
+          "groundingMetadata": {
+            "groundingChunks": [
+              {
+                "web": {
+                  "uri": "https://example.com/release",
+                  "title": "Public release notes",
+                },
+              },
+              {
+                "web": {
+                  "uri": "javascript:alert(1)",
+                  "title": "Invalid source",
+                },
+              },
+            ],
+            "webSearchQueries": ["public error timeout release"],
+          },
+        }],
+      },
+    )
+
+  monkeypatch.setattr(
+    gemini_web_search_service,
+    "create_gemini_web_search_client",
+    lambda: httpx.AsyncClient(
+      transport=httpx.MockTransport(provider_handler),
+    ),
+  )
+  response = await client.post(
+    f"/projects/{project_id}/incidents/{incident_id}/internet-search",
+    json={"query": "public error timeout release"},
+    headers=_headers(owner),
+  )
+
+  assert response.status_code == 200
+  result = response.json()
+  assert result["status"] == "success"
+  assert result["content_is_untrusted"] is True
+  assert result["data"]["sources"] == [{
+    "url": "https://example.com/release",
+    "title": "Public release notes",
+  }]
+
+  repeated = await client.post(
+    f"/projects/{project_id}/incidents/{incident_id}/internet-search",
+    json={"query": "public error timeout release"},
+    headers=_headers(owner),
+  )
+  assert repeated.status_code == 200
+  assert repeated.json()["evidence"][0]["id"] == result["evidence"][0]["id"]
+
+  evidence = await client.get(
+    f"/projects/{project_id}/incidents/{incident_id}/evidence",
+    headers=_headers(owner),
+  )
+  web_evidence = [
+    item for item in evidence.json()
+    if item["evidence_type"] == "web_search"
+  ]
+  assert len(web_evidence) == 1
+  assert web_evidence[0]["normalized_content"]["content_is_untrusted"] is True
+  context = await client.get(
+    f"/projects/{project_id}/incidents/{incident_id}/context",
+    headers=_headers(owner),
+  )
+  assert context.status_code == 200
+  assert any(
+    item["evidence_type"] == "web_search"
+    for item in context.json()["evidence"]
+  )
 
 
 @pytest.mark.asyncio

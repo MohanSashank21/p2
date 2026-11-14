@@ -174,7 +174,7 @@ class FakeDockerClient:
     self.closed = True
 
 
-def test_docker_host_validation_accepts_local_sockets_and_rejects_tcp(monkeypatch):
+def test_docker_host_validation_accepts_local_sockets_and_internal_proxy(monkeypatch):
   monkeypatch.delenv("DOCKER_HOST", raising=False)
   monkeypatch.setattr(settings, "DOCKER_HOST", "")
   assert docker_service._validate_local_docker_host() is None
@@ -189,9 +189,20 @@ def test_docker_host_validation_accepts_local_sockets_and_rejects_tcp(monkeypatc
   )
   assert docker_service._validate_local_docker_host() == "npipe:////./pipe/docker_engine"
 
+  monkeypatch.setattr(
+    settings,
+    "DOCKER_HOST",
+    "tcp://docker-socket-proxy:2375",
+  )
+  assert docker_service._validate_local_docker_host() == "tcp://docker-socket-proxy:2375"
+
   for unsafe_host in (
     "tcp://127.0.0.1:2375",
     "tcp://docker.example:2375",
+    "tcp://docker-socket-proxy:2376",
+    "tcp://user@docker-socket-proxy:2375",
+    "tcp://docker-socket-proxy:2375/containers",
+    "tcp://docker-socket-proxy:invalid",
     "npipe://remote/pipe/docker_engine",
   ):
     monkeypatch.setattr(settings, "DOCKER_HOST", unsafe_host)

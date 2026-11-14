@@ -13,6 +13,8 @@ COPY migrations ./migrations
 COPY alembic.ini .
 COPY docker-entrypoint.py .
 
+USER 10001:10001
+
 EXPOSE 8000
 
 ENTRYPOINT ["python", "docker-entrypoint.py"]

@@ -67,10 +67,12 @@ def _validate_local_docker_host() -> str | None:
     return None
   try:
     parsed = urlsplit(host)
+    port = parsed.port
   except ValueError as error:
     raise DockerIntegrationError(
-      503,
-      "DOCKER_HOST must be an absolute local Unix socket or Windows named pipe",
+        503,
+        "DOCKER_HOST must be an absolute local Unix socket, Windows named "
+        "pipe, or the internal Docker socket proxy",
     ) from error
   if parsed.scheme == "unix":
     if parsed.netloc or not parsed.path.startswith("/") or parsed.query or parsed.fragment:
@@ -91,10 +93,21 @@ def _validate_local_docker_host() -> str | None:
         "DOCKER_HOST must be an absolute local Unix socket or Windows named pipe",
       )
     return host
+  if (
+    parsed.scheme == "tcp"
+    and parsed.hostname == "docker-socket-proxy"
+    and port == 2375
+    and parsed.username is None
+    and parsed.password is None
+    and parsed.path in ("", "/")
+    and not parsed.query
+    and not parsed.fragment
+  ):
+    return host
   raise DockerIntegrationError(
     503,
-    "Only local Unix sockets and Windows named pipes are supported; "
-    "TCP Docker daemon endpoints are disabled",
+    "Only local Unix sockets, Windows named pipes, and the internal "
+    "read-only Docker socket proxy are supported",
   )
 
 

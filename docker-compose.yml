@@ -5,6 +5,11 @@ services:
       dockerfile: Dockerfile
     container_name: opspilot-api
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - .env
     environment:
@@ -13,13 +18,16 @@ services:
       LOKI_ALLOWED_HOSTS: "${LOKI_ALLOWED_HOSTS:-},loki:3100"
       PROMETHEUS_ALLOWED_HOSTS: "${PROMETHEUS_ALLOWED_HOSTS:-},prometheus:9090"
       TRACE_ALLOWED_HOSTS: "${TRACE_ALLOWED_HOSTS:-},tempo:3200"
-      DOCKER_HOST: unix:///var/run/docker.sock
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - default
+      - docker-control
+    tmpfs:
+      - /tmp
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:
@@ -32,6 +40,26 @@ services:
       timeout: 5s
       retries: 6
       start_period: 20s
+
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /run
+    environment:
+      CONTAINERS: "1"
+      IMAGES: "1"
+      POST: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-control
 
   loki:
     image: grafana/loki:3.5.0
@@ -96,3 +124,7 @@ volumes:
   tempo-data:
   prometheus-data:
   grafana-data:
+
+networks:
+  docker-control:
+    internal: true

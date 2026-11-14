@@ -38,6 +38,8 @@ class Settings(BaseSettings):
   GITHUB_WEBHOOK_SECRET: SecretStr | None = None
   GITHUB_API_URL: str = "https://api.github.com"
   GITHUB_API_TIMEOUT_SECONDS: int = Field(default=15, ge=1, le=60)
+  OTEL_TRACING_ENABLED: bool = False
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: str = "http://otel-collector:4318/v1/traces"
   GEMINI_API_KEY: SecretStr | None = None
   GEMINI_MODEL: str = "gemini-2.5-flash"
   GEMINI_SYNTHESIS_ENABLED: bool = False

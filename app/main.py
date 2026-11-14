@@ -9,6 +9,7 @@ from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
+from app.core.telemetry import configure_tracing
 from app.db.database import AsyncSessionLocal, check_database_connection, engine
 from app.api.router import api_router
 from app.services.github_event_worker import run_github_event_worker
@@ -66,7 +67,11 @@ async def lifespan(app: FastAPI):
       await redis_client.aclose()
     finally:
       del app.state.redis
-      await engine.dispose()
+      try:
+        await engine.dispose()
+      finally:
+        if tracer_provider is not None:
+          tracer_provider.shutdown()
 
 app = FastAPI(
   title=settings.APP_NAME,
@@ -74,6 +79,7 @@ app = FastAPI(
   debug=settings.DEBUG,
   lifespan=lifespan,
 )
+tracer_provider = configure_tracing(app)
 
 if settings.cors_origins:
   app.add_middleware(

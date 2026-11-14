@@ -19,6 +19,8 @@ services:
       PROMETHEUS_ALLOWED_HOSTS: "${PROMETHEUS_ALLOWED_HOSTS:-},prometheus:9090"
       TRACE_ALLOWED_HOSTS: "${TRACE_ALLOWED_HOSTS:-},tempo:3200"
       DOCKER_HOST: tcp://docker-socket-proxy:2375
+      OTEL_TRACING_ENABLED: "true"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
     extra_hosts:
@@ -26,6 +28,8 @@ services:
     networks:
       - default
       - docker-control
+    depends_on:
+      - otel-collector
     tmpfs:
       - /tmp
     ports:
@@ -79,6 +83,22 @@ services:
     volumes:
       - ./docker/observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
       - tempo-data:/var/tempo
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./docker/observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - tempo
 
   blackbox-exporter:
     image: prom/blackbox-exporter:v0.25.0

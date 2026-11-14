@@ -5,6 +5,8 @@ import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,6 +21,7 @@ _POLL_INTERVAL_SECONDS = 1
 _LEASE_SECONDS = 60
 _MAX_ATTEMPTS = 5
 _MAX_RETRY_DELAY_SECONDS = 300
+_tracer = trace.get_tracer(__name__)
 
 
 async def _claim_next_event(
@@ -104,35 +107,43 @@ async def process_next_github_event(
   if claimed is None:
     return False
   event_id, attempt_count = claimed
-  try:
-    async with session_factory() as session:
-      await process_github_workflow_event(session, event_id)
-      await session.commit()
-  except InvalidGitHubWorkflowEvent:
-    await _record_failure(
-      session_factory,
-      event_id,
-      attempt_count,
-      failure_code="invalid_event",
-      permanent=True,
-    )
-    logger.warning(
-      "GitHub workflow event was rejected during processing (event_id=%s)",
-      event_id,
-    )
-  except Exception as error:
-    await _record_failure(
-      session_factory,
-      event_id,
-      attempt_count,
-      failure_code="processing_error",
-      permanent=False,
-    )
-    logger.error(
-      "GitHub workflow event processing failed (event_id=%s, category=%s)",
-      event_id,
-      type(error).__name__,
-    )
+  with _tracer.start_as_current_span("github.webhook.process") as span:
+    span.set_attribute("github.webhook.event_id", str(event_id))
+    try:
+      async with session_factory() as session:
+        incident_id = await process_github_workflow_event(session, event_id)
+        await session.commit()
+        if incident_id is not None:
+          span.set_attribute("opspilot.incident.id", str(incident_id))
+    except InvalidGitHubWorkflowEvent:
+      span.set_attribute("error.type", "InvalidGitHubWorkflowEvent")
+      span.set_status(Status(StatusCode.ERROR))
+      await _record_failure(
+        session_factory,
+        event_id,
+        attempt_count,
+        failure_code="invalid_event",
+        permanent=True,
+      )
+      logger.warning(
+        "GitHub workflow event was rejected during processing (event_id=%s)",
+        event_id,
+      )
+    except Exception as error:
+      span.set_attribute("error.type", type(error).__name__)
+      span.set_status(Status(StatusCode.ERROR))
+      await _record_failure(
+        session_factory,
+        event_id,
+        attempt_count,
+        failure_code="processing_error",
+        permanent=False,
+      )
+      logger.error(
+        "GitHub workflow event processing failed (event_id=%s, category=%s)",
+        event_id,
+        type(error).__name__,
+      )
   return True
 
 

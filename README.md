@@ -59,8 +59,9 @@ Local service URLs are Grafana `http://127.0.0.1:3000`, Prometheus
 `http://127.0.0.1:3200` (OTLP/HTTP receiver `http://127.0.0.1:4318`). Grafana
 is configured for anonymous Viewer access and is bound to loopback only.
 Prometheus probes the API readiness endpoint through Blackbox Exporter.
-Grafana has Prometheus, Loki, and Tempo data sources provisioned; the API does
-not currently push logs to Loki or export traces to Tempo.
+Grafana has Prometheus, Loki, and Tempo data sources provisioned. The API
+exports FastAPI request spans and GitHub workflow-processing spans through the
+OpenTelemetry Collector to Tempo. The API does not currently push logs to Loki.
 
 For Loki connections, set `LOKI_ALLOWED_HOSTS` to a comma-separated exact
 host allowlist (include `:port` when using a non-default port). Generate and
@@ -152,12 +153,18 @@ read operations.
 
 ## OpenTelemetry traces
 
-OpsPilot queries an existing Grafana Tempo trace backend; it does not receive
-OTLP telemetry and does not require users to run an OpsPilot Docker stack.
-Application OpenTelemetry SDKs create spans, and an OpenTelemetry Collector or
-an SDK exporter sends them to a trace backend. Tempo stores those traces.
-OpsPilot uses Tempo's query API (`/api/search` and `/api/traces/{traceID}`) to
-retrieve bounded evidence. An OTLP ingest URL is not a trace-query endpoint.
+The Docker Compose stack enables FastAPI request tracing and a separate span
+for durable GitHub workflow-event processing. The latter includes the
+webhook-event and resulting incident IDs for correlation. The OpenTelemetry
+Collector receives OTLP/HTTP on the internal Docker network and exports traces
+to Tempo; its receiver is not published to the host. Tracing is disabled by
+default when running the API outside Compose. Set `OTEL_TRACING_ENABLED=true`
+and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to enable it with an OTLP/HTTP
+collector.
+
+OpsPilot also queries a configured Grafana Tempo trace backend through Tempo's
+query API (`/api/search` and `/api/traces/{traceID}`) to retrieve bounded
+evidence. An OTLP ingest URL is not a trace-query endpoint.
 
 Set `TRACE_ALLOWED_HOSTS` to a comma-separated exact-host allowlist for Tempo
 (include `:port` for a non-default port). Keep `TRACE_CREDENTIAL_ENCRYPTION_KEY`

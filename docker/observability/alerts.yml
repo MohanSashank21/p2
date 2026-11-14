@@ -1,0 +1,57 @@
+groups:
+  - name: opspilot-api
+    rules:
+      - alert: OpsPilotAPIMetricsTargetDown
+        expr: up{job="opspilot-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: opspilot-api
+        annotations:
+          summary: OpsPilot API metrics endpoint is unavailable
+          description: Prometheus has not been able to scrape the internal API metrics endpoint for one minute.
+
+      - alert: OpsPilotAPIReadinessFailed
+        expr: probe_success{job="opspilot-api-readiness"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: opspilot-api
+        annotations:
+          summary: OpsPilot API readiness check is failing
+          description: The API readiness probe has failed for one minute.
+
+      - alert: OpsPilotAPIHighServerErrorRate
+        expr: |
+          (
+            sum(rate(opspilot_http_requests_total{job="opspilot-api", status_code=~"5.."}[5m]))
+            /
+            sum(rate(opspilot_http_requests_total{job="opspilot-api"}[5m]))
+          ) > 0.05
+          and
+          sum(rate(opspilot_http_requests_total{job="opspilot-api"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: opspilot-api
+        annotations:
+          summary: OpsPilot API server error rate is above 5%
+          description: More than 5% of API requests have returned 5xx responses over the last five minutes.
+
+      - alert: OpsPilotAPIHighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(opspilot_http_request_duration_seconds_bucket{job="opspilot-api"}[5m])
+            )
+          ) > 1
+          and
+          sum(rate(opspilot_http_request_duration_seconds_count{job="opspilot-api"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: opspilot-api
+        annotations:
+          summary: OpsPilot API p95 latency is above one second
+          description: The 95th percentile of API request latency has remained above one second for five minutes.

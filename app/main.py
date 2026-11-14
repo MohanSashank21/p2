@@ -9,6 +9,8 @@ from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import settings
+from app.core.prometheus_metrics import instrument_api
+from app.core.prometheus_metrics_server import start_metrics_server
 from app.core.telemetry import configure_tracing
 from app.db.database import AsyncSessionLocal, check_database_connection, engine
 from app.api.router import api_router
@@ -34,9 +36,12 @@ async def lifespan(app: FastAPI):
   
   app.state.redis = redis_client
   worker_task: asyncio.Task | None = None
+  metrics_server = None
+  metrics_task: asyncio.Task[None] | None = None
   try:
     await redis_client.ping()
     await check_database_connection()
+    metrics_server, metrics_task = await start_metrics_server()
     async with AsyncExitStack() as stack:
       if settings.AI_INVESTIGATION_ENABLED:
         app.state.investigation_checkpointer = await stack.enter_async_context(
@@ -68,10 +73,15 @@ async def lifespan(app: FastAPI):
     finally:
       del app.state.redis
       try:
-        await engine.dispose()
+        if metrics_server is not None and metrics_task is not None:
+          metrics_server.should_exit = True
+          await metrics_task
       finally:
-        if tracer_provider is not None:
-          tracer_provider.shutdown()
+        try:
+          await engine.dispose()
+        finally:
+          if tracer_provider is not None:
+            tracer_provider.shutdown()
 
 app = FastAPI(
   title=settings.APP_NAME,
@@ -80,6 +90,7 @@ app = FastAPI(
   lifespan=lifespan,
 )
 tracer_provider = configure_tracing(app)
+instrument_api(app)
 
 if settings.cors_origins:
   app.add_middleware(

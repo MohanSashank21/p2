@@ -47,6 +47,7 @@ from app.schemas.investigation_schema import (
   CombinedIncidentInvestigationResponse,
   InvestigationRunResponse,
 )
+from app.schemas.internet_search_schema import InternetSearchRequest
 from app.schemas.investigation_synthesis_schema import (
   InvestigationSynthesisRunResponse,
   UnsupportedEvidenceCitationError,
@@ -105,6 +106,8 @@ from app.services.trace_service import (
   TraceQuery,
   retrieve_incident_traces,
 )
+from app.tools.contracts import ToolContext, ToolResult
+from app.tools.registry import create_tool_registry
 
 router = APIRouter(prefix="/projects/{project_id}/incidents", tags=["incidents"])
 
@@ -635,6 +638,76 @@ async def investigate_incident_integrations_endpoint(
       "The investigation ended before a result could be finalized.",
     )
     raise
+
+
+@router.post(
+  "/{incident_id}/internet-search",
+  response_model=ToolResult,
+)
+async def search_internet_for_incident(
+  project_id: uuid.UUID,
+  incident_id: uuid.UUID,
+  request: InternetSearchRequest,
+  user: User = Depends(get_current_user),
+  redis: Redis = Depends(get_redis),
+  session: AsyncSession = Depends(get_db),
+) -> ToolResult:
+  try:
+    await get_project_incident(session, project_id, incident_id, user)
+  except (ProjectNotFoundError, IncidentNotFoundError, PermissionDeniedError) as error:
+    raise _raise_access_error(error) from error
+
+  if not settings.GEMINI_WEB_SEARCH_ENABLED:
+    raise HTTPException(
+      status_code=503,
+      detail="Internet search is disabled by server configuration.",
+    )
+  if settings.GEMINI_API_KEY is None:
+    raise HTTPException(
+      status_code=503,
+      detail="Internet search is not configured on the server.",
+    )
+
+  context = ToolContext(
+    session=session,
+    redis=redis,
+    project_id=project_id,
+    incident_id=incident_id,
+    user=user,
+  )
+  result = await create_tool_registry().execute(
+    "internet.search",
+    request.model_dump(mode="json"),
+    context,
+  )
+  if result.status == "error":
+    if result.error is None:
+      raise RuntimeError("Internet-search tool returned an error without details.")
+    status_code = 429 if result.error.code == "rate_limited" else 502
+    raise HTTPException(
+      status_code=status_code,
+      detail={"code": result.error.code, "message": result.error.message},
+      headers={"Retry-After": "60"} if status_code == 429 else None,
+    )
+  if result.status == "unavailable":
+    if result.error is None:
+      raise RuntimeError(
+        "Internet-search tool reported unavailable without details.",
+      )
+    status_code = {
+      "provider_timeout": 504,
+      "provider_rate_limited": 429,
+      "provider_unavailable": 503,
+      "provider_not_configured": 503,
+      "internet_search_disabled": 503,
+    }.get(result.error.code, 502)
+    raise HTTPException(
+      status_code=status_code,
+      detail={"code": result.error.code, "message": result.error.message},
+      headers={"Retry-After": "60"} if status_code == 429 else None,
+    )
+  return result
+
 
 @router.post("/{incident_id}/loki-logs", response_model=LokiQueryResponse)
 async def retrieve_loki_logs(

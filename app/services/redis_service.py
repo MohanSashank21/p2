@@ -202,6 +202,20 @@ async def rate_limit_gemini_synthesis(
   )
 
 
+async def rate_limit_gemini_web_search(
+  client: Redis,
+  project_id: uuid.UUID,
+  user_id: uuid.UUID,
+) -> None:
+  await bump_rate_limit(
+    client,
+    "gemini-web-search",
+    f"{project_id}:{user_id}",
+    limit=10,
+    window_seconds=60,
+  )
+
+
 async def limit_email_and_ip(
   client: Redis,
   email: str,

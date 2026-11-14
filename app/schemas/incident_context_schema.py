@@ -20,6 +20,7 @@ class IncidentContextEvidence(BaseModel):
     "docker_investigation",
     "prometheus_metrics",
     "github_workflow_event",
+    "web_search",
   ]
   source_id: uuid.UUID | None
   source_event_id: uuid.UUID | None

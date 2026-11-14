@@ -27,8 +27,10 @@ The current backend includes:
 * Deterministic incident context with timeline and exact-identifier
   correlations. Correlation is not causal proof.
 * Durable investigation run records, idempotency, and status/history.
-* A static typed tool registry and a feature-gated, one-call Gemini synthesis
-  endpoint for evidence on a completed run. Synthesis does not call tools.
+* A static typed tool registry, an operator-triggered, feature-gated Gemini
+  Google Search grounding tool with persisted citations, and a feature-gated,
+  one-call Gemini synthesis endpoint for evidence on a completed run.
+  Synthesis does not call tools.
 
 One live Gemini request using only the synthetic `metric-regression` fixture
 succeeded. This verifies a provider request, not report accuracy, the complete
@@ -102,6 +104,10 @@ against an already connected repository.
 * The registry is an internal tool catalog, not a generalized registry for
   arbitrary integrations. Add new entries only alongside a real adapter,
   typed schema, authorization checks, and tests.
+* Public web search is a separately enabled, operator-triggered tool. Its
+  query and result are sent to Google, validated citations and answer are
+  persisted as untrusted incident evidence, and searches are rate-limited.
+  It is not automatically invoked by the internal investigation graph.
 * The backend includes output schemas and fail-closed read-only registration,
   but budgets and per-run execution accounting belong to Phase 3's execution
   engine, not the static registry.
@@ -236,7 +242,9 @@ terminal outcome and budget usage.
 `AI_INVESTIGATION_ENABLED` defaults to false. When enabled it initializes the
 PostgreSQL checkpointer; it does not enable a model provider or expose an API
 route. The run service is internal and requires an injected model and
-checkpointer. No live Gemini calls or mutating tools are enabled. The
+checkpointer. No production model adapter or user-facing AI-directed
+investigation endpoint is implemented. No live Gemini agent calls or mutating
+tools are enabled. The
 `agent_report` migration has been added but has not been applied to any
 database.
 

@@ -9,6 +9,7 @@ from fastapi import (
   Header,
   HTTPException,
   Query,
+  Request as FastAPIRequest,
   Response as FastAPIResponse,
   status,
 )
@@ -43,6 +44,7 @@ from app.schemas.incident_schema import (
   TraceQueryResponse,
 )
 from app.schemas.investigation_schema import (
+  AgentInvestigationRequest,
   CombinedIncidentInvestigationRequest,
   CombinedIncidentInvestigationResponse,
   InvestigationRunResponse,
@@ -65,12 +67,14 @@ from app.services.incident_investigation_service import (
   investigate_incident_integrations,
 )
 from app.services.investigation_run_service import (
+  DEFAULT_AGENT_INVESTIGATION_BUDGET,
   IdempotencyKeyConflictError,
   complete_investigation_run,
   fail_investigation_run,
   get_investigation_run,
   list_investigation_runs,
   replay_investigation_response,
+  reserve_agent_investigation_run,
   reserve_investigation_run,
   RUN_TIMEOUT_SECONDS,
 )
@@ -82,6 +86,10 @@ from app.services.gemini_synthesis_service import (
   create_gemini_client,
   synthesize_evidence,
 )
+from app.services.gemini_investigation_model import (
+  GeminiInvestigationModel,
+  create_gemini_investigation_client,
+)
 from app.services.investigation_synthesis_service import (
   InvestigationSynthesisContextError,
   build_run_synthesis_input,
@@ -90,6 +98,7 @@ from app.services.investigation_synthesis_service import (
   fail_run_synthesis,
   synthesis_run_response,
 )
+from app.services.investigation_graph_runtime import run_agent_investigation
 from app.services.incident_context_service import build_incident_context
 from app.services.loki_service import (
   LokiConnection,
@@ -322,6 +331,123 @@ async def get_investigation_run_history(
     raise _raise_access_error(error) from error
   runs = await list_investigation_runs(session, incident_id, limit, offset)
   return [_investigation_run_response(run) for run in runs]
+
+
+@router.post(
+  "/{incident_id}/investigate-ai",
+  response_model=InvestigationRunResponse,
+)
+async def start_ai_investigation(
+  project_id: uuid.UUID,
+  incident_id: uuid.UUID,
+  request_body: AgentInvestigationRequest,
+  request: FastAPIRequest,
+  response: FastAPIResponse,
+  user: User = Depends(get_current_user),
+  redis: Redis = Depends(get_redis),
+  session: AsyncSession = Depends(get_db),
+  idempotency_key: str | None = Header(
+    default=None,
+    alias="Idempotency-Key",
+    min_length=1,
+    max_length=128,
+  ),
+) -> InvestigationRunResponse:
+  try:
+    await get_project_incident(session, project_id, incident_id, user)
+  except (ProjectNotFoundError, IncidentNotFoundError, PermissionDeniedError) as error:
+    raise _raise_access_error(error) from error
+
+  if not settings.AI_INVESTIGATION_ENABLED:
+    raise HTTPException(
+      status_code=503,
+      detail="AI investigation is disabled by server configuration.",
+    )
+  api_key = settings.GEMINI_API_KEY
+  if api_key is None:
+    raise HTTPException(
+      status_code=503,
+      detail="AI investigation is not configured on the server.",
+    )
+  checkpointer = getattr(request.app.state, "investigation_checkpointer", None)
+  if checkpointer is None:
+    raise HTTPException(
+      status_code=503,
+      detail="Durable AI investigation checkpoints are unavailable.",
+    )
+  if idempotency_key is not None and (
+    idempotency_key != idempotency_key.strip()
+    or any(ord(character) < 33 or ord(character) > 126 for character in idempotency_key)
+  ):
+    raise HTTPException(
+      status_code=422,
+      detail="Idempotency-Key must contain printable ASCII without whitespace.",
+    )
+
+  try:
+    run, created = await reserve_agent_investigation_run(
+      session,
+      project_id,
+      incident_id,
+      user,
+      request_body.question,
+      DEFAULT_AGENT_INVESTIGATION_BUDGET,
+      idempotency_key,
+    )
+  except IdempotencyKeyConflictError as error:
+    raise HTTPException(
+      status_code=409,
+      detail="Idempotency-Key was already used with a different request.",
+    ) from error
+
+  response.headers["X-Investigation-Run-ID"] = str(run.id)
+  if not created:
+    if run.status == "running":
+      raise HTTPException(
+        status_code=409,
+        detail={
+          "message": "An AI investigation with this Idempotency-Key is still running.",
+          "run_id": str(run.id),
+        },
+      )
+    return _investigation_run_response(run)
+
+  try:
+    async with create_gemini_investigation_client() as client:
+      model = GeminiInvestigationModel(
+        api_key=api_key.get_secret_value(),
+        client=client,
+      )
+      completed_run, _state = await run_agent_investigation(
+        session=session,
+        redis=redis,
+        run=run,
+        user=user,
+        question=request_body.question,
+        registry=create_tool_registry(include_internet_search=False),
+        model=model,
+        checkpointer=checkpointer,
+        budget=DEFAULT_AGENT_INVESTIGATION_BUDGET,
+      )
+  except asyncio.CancelledError:
+    await fail_investigation_run(
+      session,
+      run.id,
+      "request_cancelled",
+      "The AI investigation request was cancelled.",
+      status="cancelled",
+    )
+    raise
+  except Exception:
+    await fail_investigation_run(
+      session,
+      run.id,
+      "investigation_execution_error",
+      "The AI investigation failed before a result could be finalized.",
+    )
+    raise
+
+  return _investigation_run_response(completed_run)
 
 
 @router.get(

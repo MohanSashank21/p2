@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
+import logging
+import random
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -12,6 +13,33 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+logger = logging.getLogger(__name__)
+
+
+def _safe_validation_summary(error: ValidationError, *, field_name: str) -> str:
+  details: list[str] = []
+  for issue in error.errors(include_input=False)[:5]:
+    loc = [
+      str(part)
+      for part in issue.get("loc", ())
+      if part not in {"__root__"}
+    ]
+    path = ".".join(loc) if loc else field_name
+    type_name = issue.get("type", "invalid_value")
+    if type_name == "missing":
+      details.append(f"{path}:missing_field")
+    elif type_name == "literal_error":
+      details.append(f"{path}:invalid_enum")
+    elif type_name.endswith("_type") or type_name == "int_parsing":
+      details.append(f"{path}:type_mismatch")
+    elif type_name == "too_short" or type_name == "too_long":
+      details.append(f"{path}:length_invalid")
+    elif type_name == "greater_than" or type_name == "less_than":
+      details.append(f"{path}:range_invalid")
+    else:
+      details.append(f"{path}:invalid_value")
+  return ", ".join(dict.fromkeys(details)) or f"{field_name}:invalid_value"
+
 
 class InvestigationBudget(BaseModel):
   model_config = ConfigDict(extra="forbid", strict=True)
@@ -20,8 +48,6 @@ class InvestigationBudget(BaseModel):
   max_model_calls: int = Field(ge=1, le=32)
   max_model_tokens: int = Field(ge=1, le=100_000)
   max_tool_calls: int = Field(ge=0, le=64)
-  max_duration_seconds: float = Field(gt=0, le=900)
-  max_step_seconds: float = Field(gt=0, le=120)
   max_output_tokens_per_call: int = Field(ge=1, le=8192)
 
 
@@ -64,6 +90,8 @@ class InvestigationDecision(BaseModel):
         or self.arguments
       ):
         raise ValueError("A conclusion requires a claim and no tool request.")
+      if not self.evidence_ids:
+        raise ValueError("A conclusion requires at least one evidence citation.")
     elif (
       self.tool_name is not None
       or self.arguments
@@ -94,7 +122,27 @@ class ReadOnlyToolDescriptor(BaseModel):
 
 
 class ModelProviderError(Exception):
-  pass
+  def __init__(
+    self,
+    message: str,
+    *,
+    failure_code: str = "model_provider_failure",
+    retryable: bool = False,
+    retry_after_seconds: float | None = None,
+    http_status: int | None = None,
+    provider_status: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+  ) -> None:
+    self.failure_code = failure_code
+    self.safe_detail = message
+    self.retryable = retryable
+    self.retry_after_seconds = retry_after_seconds
+    self.http_status = http_status
+    self.provider_status = provider_status
+    self.input_tokens = input_tokens
+    self.output_tokens = output_tokens
+    super().__init__(message)
 
 
 class ReadOnlyToolError(Exception):
@@ -102,7 +150,7 @@ class ReadOnlyToolError(Exception):
 
 
 class InvestigationModel(Protocol):
-  def count_input_tokens(self, payload: dict[str, Any]) -> int: ...
+  async def count_input_tokens(self, payload: dict[str, Any]) -> int: ...
 
   async def propose(
     self,
@@ -144,10 +192,11 @@ class InvestigationGraphState(TypedDict, total=False):
   tools: list[dict[str, Any]]
   cycle_count: int
   model_call_count: int
+  provider_attempt_count: int
   model_tokens_consumed: int
+  model_tokens_unreconciled: int
   model_tokens_reserved: int
   tool_call_count: int
-  deadline_epoch_seconds: float
   reserved_input_tokens: int
   reserved_output_tokens: int
   decision: dict[str, Any]
@@ -157,6 +206,7 @@ class InvestigationGraphState(TypedDict, total=False):
   claim: str | None
   evidence_citations: list[str]
   stop_reason: str
+  failure_detail: str
   terminal: bool
   tool_failures: list[dict[str, str]]
   interrupted: bool
@@ -171,8 +221,6 @@ def create_investigation_state(
   tools: Sequence[ReadOnlyToolBinding],
   budget: InvestigationBudget,
   initial_evidence_truncated: bool = False,
-  deadline_epoch_seconds: float | None = None,
-  clock: Callable[[], float] = time.time,
 ) -> InvestigationGraphState:
   if not question.strip():
     raise ValueError("Investigation question must not be blank.")
@@ -194,14 +242,11 @@ def create_investigation_state(
     tools=descriptors,
     cycle_count=0,
     model_call_count=0,
+    provider_attempt_count=0,
     model_tokens_consumed=0,
+    model_tokens_unreconciled=0,
     model_tokens_reserved=0,
     tool_call_count=0,
-    deadline_epoch_seconds=(
-      deadline_epoch_seconds
-      if deadline_epoch_seconds is not None
-      else clock() + budget.max_duration_seconds
-    ),
     tool_failures=[],
     terminal=False,
   )
@@ -230,19 +275,14 @@ def _parse_tool_result(value: ReadOnlyToolResult | dict[str, Any]) -> ReadOnlyTo
   return ReadOnlyToolResult.model_validate_json(json.dumps(payload))
 
 
-def _remaining_seconds(
-  state: InvestigationGraphState,
-  clock: Callable[[], float],
-) -> float:
-  return state["deadline_epoch_seconds"] - clock()
-
-
 def _stop(
   state: InvestigationGraphState,
   outcome: Literal["inconclusive", "failed"],
   reason: str,
+  *,
+  failure_detail: str | None = None,
 ) -> dict[str, Any]:
-  return {
+  result = {
     "outcome": outcome,
     "claim": None,
     "evidence_citations": [],
@@ -250,6 +290,9 @@ def _stop(
     "terminal": True,
     "tool_failures": state.get("tool_failures", []),
   }
+  if failure_detail is not None:
+    result["failure_detail"] = failure_detail
+  return result
 
 
 def compile_investigation_graph(
@@ -258,7 +301,6 @@ def compile_investigation_graph(
   tools: Sequence[ReadOnlyToolBinding],
   budget: InvestigationBudget,
   checkpointer: BaseCheckpointSaver | None = None,
-  clock: Callable[[], float] = time.time,
   interrupt_before: Sequence[str] = (),
   interrupt_after: Sequence[str] = (),
 ):
@@ -275,39 +317,72 @@ def compile_investigation_graph(
       and state.get("tools") == descriptors
       and type(state.get("model_tokens_consumed")) is int
       and state["model_tokens_consumed"] >= 0
+      and type(state.get("model_tokens_unreconciled", 0)) is int
+      and state.get("model_tokens_unreconciled", 0) >= 0
       and type(state.get("model_tokens_reserved")) is int
       and state["model_tokens_reserved"] >= 0
     )
 
+  def retry_delay(error: ModelProviderError, retry_index: int) -> float:
+    if error.retry_after_seconds is not None:
+      return error.retry_after_seconds
+    maximum = min(2.0, 0.5 * (2 ** retry_index))
+    return random.uniform(0, maximum)
+
   def reserve_cycle(state: InvestigationGraphState) -> dict[str, Any]:
     if not configuration_matches(state):
       return _stop(state, "failed", "run_configuration_changed")
-    if _remaining_seconds(state, clock) <= 0:
-      return _stop(state, "inconclusive", "time_budget_exhausted")
     if state["cycle_count"] >= budget.max_cycles:
       return _stop(state, "inconclusive", "cycle_budget_exhausted")
     return {"cycle_count": state["cycle_count"] + 1}
 
-  def reserve_model(state: InvestigationGraphState) -> dict[str, Any]:
+  async def reserve_model(state: InvestigationGraphState) -> dict[str, Any]:
     if not configuration_matches(state):
       return _stop(state, "failed", "run_configuration_changed")
-    if _remaining_seconds(state, clock) <= 0:
-      return _stop(state, "inconclusive", "time_budget_exhausted")
     if state["model_call_count"] >= budget.max_model_calls:
       return _stop(state, "inconclusive", "model_call_budget_exhausted")
-    try:
-      input_tokens = model.count_input_tokens(_model_input(state))
-    except (TypeError, ValueError):
-      return _stop(state, "failed", "invalid_model_token_count")
+    provider_attempt_count = state.get("provider_attempt_count", 0)
+    retry_count = 0
+    while True:
+      provider_attempt_count += 1
+      try:
+        input_tokens = await model.count_input_tokens(_model_input(state))
+        break
+      except ModelProviderError as error:
+        if not error.retryable or retry_count >= 2:
+          return {
+            **_stop(
+              state,
+              "failed",
+              (
+                "model_token_count_failure"
+                if error.failure_code == "model_provider_failure"
+                else error.failure_code
+              ),
+              failure_detail=error.safe_detail,
+            ),
+            "provider_attempt_count": provider_attempt_count,
+          }
+        await asyncio.sleep(retry_delay(error, retry_count))
+        retry_count += 1
+      except (TypeError, ValueError):
+        return {
+          **_stop(state, "failed", "invalid_model_token_count"),
+          "provider_attempt_count": provider_attempt_count,
+        }
     if (
       isinstance(input_tokens, bool)
       or not isinstance(input_tokens, int)
       or input_tokens < 0
     ):
-      return _stop(state, "failed", "invalid_model_token_count")
+      return {
+        **_stop(state, "failed", "invalid_model_token_count"),
+        "provider_attempt_count": provider_attempt_count,
+      }
     remaining_tokens = (
       budget.max_model_tokens
       - state["model_tokens_consumed"]
+      - state.get("model_tokens_unreconciled", 0)
       - state["model_tokens_reserved"]
     )
     output_tokens = min(
@@ -315,9 +390,13 @@ def compile_investigation_graph(
       remaining_tokens - input_tokens,
     )
     if output_tokens < 1:
-      return _stop(state, "inconclusive", "model_token_budget_exhausted")
+      return {
+        **_stop(state, "inconclusive", "model_token_budget_exhausted"),
+        "provider_attempt_count": provider_attempt_count,
+      }
     return {
       "model_call_count": state["model_call_count"] + 1,
+      "provider_attempt_count": provider_attempt_count,
       "model_tokens_reserved": input_tokens + output_tokens,
       "reserved_input_tokens": input_tokens,
       "reserved_output_tokens": output_tokens,
@@ -326,19 +405,124 @@ def compile_investigation_graph(
   async def call_model(state: InvestigationGraphState) -> dict[str, Any]:
     if not configuration_matches(state):
       return _stop(state, "failed", "run_configuration_changed")
-    remaining = _remaining_seconds(state, clock)
-    if remaining <= 0:
-      return _stop(state, "inconclusive", "time_budget_exhausted")
-    try:
-      async with asyncio.timeout(min(budget.max_step_seconds, remaining)):
+    model_call_count = state["model_call_count"]
+    provider_attempt_count = state.get("provider_attempt_count", 0)
+    model_tokens_consumed = state["model_tokens_consumed"]
+    model_tokens_unreconciled = state.get("model_tokens_unreconciled", 0)
+    reserved_input_tokens = state["reserved_input_tokens"]
+    reserved_output_tokens = state["reserved_output_tokens"]
+    model_tokens_reserved = state["model_tokens_reserved"]
+    retry_count = 0
+
+    def failed_call(reason: str, detail: str) -> dict[str, Any]:
+      return {
+        **_stop(state, "failed", reason, failure_detail=detail),
+        "model_call_count": model_call_count,
+        "provider_attempt_count": provider_attempt_count,
+        "model_tokens_consumed": model_tokens_consumed,
+        "model_tokens_unreconciled": model_tokens_unreconciled,
+        "model_tokens_reserved": 0,
+        "reserved_input_tokens": 0,
+        "reserved_output_tokens": 0,
+      }
+
+    while True:
+      provider_attempt_count += 1
+      try:
         raw_response = await model.propose(
           _model_input(state),
-          max_output_tokens=state["reserved_output_tokens"],
+          max_output_tokens=reserved_output_tokens,
         )
-    except TimeoutError:
-      return _stop(state, "failed", "model_timeout")
-    except ModelProviderError:
-      return _stop(state, "failed", "model_provider_failure")
+        break
+      except ModelProviderError as error:
+        attempt_reservation = reserved_input_tokens + reserved_output_tokens
+        has_usage = (
+          type(error.input_tokens) is int
+          and error.input_tokens >= 0
+          and type(error.output_tokens) is int
+          and error.output_tokens >= 0
+        )
+        actual_tokens = (
+          error.input_tokens + error.output_tokens
+          if has_usage
+          else 0
+        )
+        if has_usage:
+          model_tokens_consumed += actual_tokens
+        else:
+          model_tokens_unreconciled += attempt_reservation
+        model_tokens_reserved = 0
+        reserved_input_tokens = 0
+        reserved_output_tokens = 0
+
+        if has_usage and actual_tokens > attempt_reservation:
+          return failed_call(
+            "model_token_reservation_exceeded",
+            "Gemini reported token usage above the reserved amount.",
+          )
+        if (
+          model_tokens_consumed + model_tokens_unreconciled
+          > budget.max_model_tokens
+        ):
+          return failed_call(
+            "model_total_token_budget_exceeded",
+            "Confirmed and unconfirmed provider usage exceeded the "
+            "investigation token budget.",
+          )
+        if (
+          not error.retryable
+          or retry_count >= 2
+          or model_call_count >= budget.max_model_calls
+        ):
+          if error.failure_code == "invalid_investigation_decision":
+            logger.warning(
+              "Gemini investigation decision failed schema validation",
+              extra={
+                "investigation_run_id": state["run_id"],
+                "failure_code": error.failure_code,
+                "response_format": "application/json",
+                "response_schema": "investigation_decision",
+                "provider_http_status": 200,
+                "candidate_finish_reason": "STOP",
+                "generation_attempt": retry_count + 1,
+                "provider_request_count": provider_attempt_count,
+                "input_tokens": error.input_tokens,
+                "output_tokens": error.output_tokens,
+                "validation_diagnostic": error.safe_detail,
+              },
+            )
+            return failed_call(
+              error.failure_code,
+              "Gemini returned an invalid investigation decision.",
+            )
+          return failed_call(error.failure_code, error.safe_detail)
+
+        delay = retry_delay(error, retry_count)
+
+        available_tokens = (
+          budget.max_model_tokens
+          - model_tokens_consumed
+          - model_tokens_unreconciled
+        )
+        next_output_tokens = min(
+          budget.max_output_tokens_per_call,
+          available_tokens - state["reserved_input_tokens"],
+        )
+        if next_output_tokens < 1:
+          return failed_call(
+            error.failure_code,
+            f"{error.safe_detail} The retry was not made because the "
+            "remaining token budget could not cover another request.",
+          )
+
+        await asyncio.sleep(delay)
+        retry_count += 1
+        model_call_count += 1
+        reserved_input_tokens = state["reserved_input_tokens"]
+        reserved_output_tokens = next_output_tokens
+        model_tokens_reserved = (
+          reserved_input_tokens + reserved_output_tokens
+        )
     try:
       response_payload = (
         raw_response.model_dump(mode="json")
@@ -349,21 +533,40 @@ def compile_investigation_graph(
         json.dumps(response_payload),
       )
     except (ValidationError, TypeError, ValueError):
-      return _stop(state, "failed", "malformed_model_response")
+      model_tokens_unreconciled += model_tokens_reserved
+      return failed_call(
+        "malformed_model_response",
+        "Gemini returned a response that did not match the investigation "
+        "schema; provider usage could not be confirmed.",
+      )
     actual_tokens = response.input_tokens + response.output_tokens
     usage_update = {
-      "model_tokens_consumed": state["model_tokens_consumed"] + actual_tokens,
+      "model_call_count": model_call_count,
+      "provider_attempt_count": provider_attempt_count,
+      "model_tokens_consumed": model_tokens_consumed + actual_tokens,
+      "model_tokens_unreconciled": model_tokens_unreconciled,
       "model_tokens_reserved": 0,
       "reserved_input_tokens": 0,
       "reserved_output_tokens": 0,
     }
+    if response.input_tokens > reserved_input_tokens:
+      return {
+        **_stop(state, "failed", "model_input_token_reservation_exceeded"),
+        **usage_update,
+      }
+    if response.output_tokens > reserved_output_tokens:
+      return {
+        **_stop(state, "failed", "model_output_token_reservation_exceeded"),
+        **usage_update,
+      }
     if (
-      response.input_tokens > state["reserved_input_tokens"]
-      or response.output_tokens > state["reserved_output_tokens"]
-      or state["model_tokens_consumed"] + actual_tokens > budget.max_model_tokens
+      model_tokens_consumed
+      + model_tokens_unreconciled
+      + actual_tokens
+      > budget.max_model_tokens
     ):
       return {
-        **_stop(state, "failed", "model_token_limit_exceeded"),
+        **_stop(state, "failed", "model_total_token_budget_exceeded"),
         **usage_update,
       }
     decision = response.decision
@@ -371,7 +574,10 @@ def compile_investigation_graph(
       available_ids = {row["id"] for row in state["evidence"]}
       cited_ids = {str(item) for item in decision.evidence_ids}
       if not cited_ids.issubset(available_ids):
-        return _stop(state, "failed", "unsupported_evidence_citation")
+        return {
+          **_stop(state, "failed", "unsupported_evidence_citation"),
+          **usage_update,
+        }
     return {
       **usage_update,
       "decision": decision.model_dump(mode="json"),
@@ -398,20 +604,19 @@ def compile_investigation_graph(
     if state["tool_call_count"] >= budget.max_tool_calls:
       return _stop(state, "inconclusive", "tool_call_budget_exhausted")
     reservation = {"tool_call_count": state["tool_call_count"] + 1}
-    if _remaining_seconds(state, clock) <= 0:
-      return {
-        **_stop(state, "inconclusive", "time_budget_exhausted"),
-        **reservation,
-      }
     binding = bindings.get(decision.tool_name or "")
     if binding is None:
       return {
         **_stop(state, "failed", "tool_not_authorized"),
         **reservation,
+        "tool_failures": state["tool_failures"] + [{
+          "tool_name": decision.tool_name or "",
+          "failure_code": "tool_not_authorized",
+        }],
       }
     try:
-      validated = binding.input_model.model_validate(
-        decision.arguments,
+      validated = binding.input_model.model_validate_json(
+        json.dumps(decision.arguments),
         strict=True,
         extra="forbid",
       )
@@ -429,23 +634,9 @@ def compile_investigation_graph(
   async def execute_tool(state: InvestigationGraphState) -> dict[str, Any]:
     if not configuration_matches(state):
       return _stop(state, "failed", "run_configuration_changed")
-    remaining = _remaining_seconds(state, clock)
-    if remaining <= 0:
-      return _stop(state, "inconclusive", "time_budget_exhausted")
     binding = bindings[state["pending_tool_name"]]
     try:
-      async with asyncio.timeout(min(budget.max_step_seconds, remaining)):
-        raw_result = await binding.handler(state["pending_tool_arguments"])
-    except TimeoutError:
-      failures = state["tool_failures"] + [{
-        "tool_name": binding.name,
-        "failure_code": "tool_timeout",
-      }]
-      return {
-        "tool_failures": failures,
-        "pending_tool_name": "",
-        "pending_tool_arguments": {},
-      }
+      raw_result = await binding.handler(state["pending_tool_arguments"])
     except ReadOnlyToolError as error:
       failures = state["tool_failures"] + [{
         "tool_name": binding.name,
@@ -483,7 +674,7 @@ def compile_investigation_graph(
       }
     existing_ids = {row["id"] for row in state["evidence"]}
     new_ids = [row["id"] for row in evidence_rows]
-    if len(set(new_ids)) != len(new_ids) or existing_ids.intersection(new_ids):
+    if len(set(new_ids)) != len(new_ids):
       failures = state["tool_failures"] + [{
         "tool_name": binding.name,
         "failure_code": "duplicate_evidence_id",
@@ -494,6 +685,28 @@ def compile_investigation_graph(
         "pending_tool_name": "",
         "pending_tool_arguments": {},
       }
+    existing_by_id = {
+      row["id"]: row
+      for row in state["evidence"]
+    }
+    if any(
+      row["id"] in existing_by_id and row != existing_by_id[row["id"]]
+      for row in evidence_rows
+    ):
+      failures = state["tool_failures"] + [{
+        "tool_name": binding.name,
+        "failure_code": "duplicate_evidence_id",
+      }]
+      evidence_rows = []
+      return {
+        "tool_failures": failures,
+        "pending_tool_name": "",
+        "pending_tool_arguments": {},
+      }
+    evidence_rows = [
+      row for row in evidence_rows
+      if row["id"] not in existing_ids
+    ]
 
     failures = state["tool_failures"]
     if result.status in {"unavailable", "error"}:

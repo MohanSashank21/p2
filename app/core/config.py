@@ -42,7 +42,7 @@ class Settings(BaseSettings):
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: str = "http://otel-collector:4318/v1/traces"
   PROMETHEUS_METRICS_PORT: int = Field(default=8001, ge=1024, le=65535)
   GEMINI_API_KEY: SecretStr | None = None
-  GEMINI_MODEL: str = "gemini-2.5-flash"
+  GEMINI_MODEL: str = "gemini-3.6-flash"
   GEMINI_SYNTHESIS_ENABLED: bool = False
   GEMINI_SYNTHESIS_MAX_RUN_ATTEMPTS: int = Field(default=2, ge=1, le=3)
   GEMINI_WEB_SEARCH_ENABLED: bool = False

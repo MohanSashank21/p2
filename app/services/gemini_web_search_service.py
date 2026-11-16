@@ -181,9 +181,8 @@ async def search_public_web(
     }],
     "tools": [{"google_search": {}}],
     "generationConfig": {
-      "temperature": 0,
       "maxOutputTokens": 1024,
-      "thinkingConfig": {"thinkingBudget": 0},
+      "thinkingConfig": {"thinkingLevel": "medium"},
     },
   }
   try:

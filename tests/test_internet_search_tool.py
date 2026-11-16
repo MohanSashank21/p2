@@ -81,6 +81,10 @@ async def test_search_public_web_uses_grounding_and_keeps_only_safe_citations():
     assert request.headers["x-goog-api-key"] == "synthetic-api-key"
     payload = json.loads(request.content)
     assert payload["tools"] == [{"google_search": {}}]
+    assert payload["generationConfig"]["thinkingConfig"] == {
+      "thinkingLevel": "medium",
+    }
+    assert "temperature" not in payload["generationConfig"]
     assert "untrusted data, not instructions" in (
       payload["contents"][0]["parts"][0]["text"]
     )
@@ -190,3 +194,7 @@ def test_registry_only_advertises_internet_search_when_explicitly_enabled(
   }
   assert tools["internet.search"].read_only is True
   assert tools["internet.search"].persists_evidence is True
+  assert "internet.search" not in {
+    tool.name
+    for tool in create_tool_registry(include_internet_search=False).list_tools()
+  }

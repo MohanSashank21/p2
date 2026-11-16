@@ -26,6 +26,7 @@ from app.services.investigation_graph import (
   InvestigationModelResponse,
 )
 from app.services.investigation_run_service import (
+  DEFAULT_AGENT_INVESTIGATION_BUDGET,
   IdempotencyKeyConflictError,
   reserve_agent_investigation_run,
 )
@@ -82,7 +83,7 @@ class ScriptedAbstentionModel:
   def __init__(self) -> None:
     self.calls = 0
 
-  def count_input_tokens(self, payload: dict) -> int:
+  async def count_input_tokens(self, payload: dict) -> int:
     return len(json.dumps(payload))
 
   async def propose(
@@ -94,9 +95,22 @@ class ScriptedAbstentionModel:
     self.calls += 1
     return InvestigationModelResponse(
       decision=InvestigationDecision(action="inconclusive"),
-      input_tokens=self.count_input_tokens(_payload),
+      input_tokens=await self.count_input_tokens(_payload),
       output_tokens=min(1, max_output_tokens),
     )
+
+
+class ExpiringRun(SimpleNamespace):
+  def __init__(self, *, run_id: uuid.UUID, **attributes):
+    super().__init__(**attributes)
+    self._run_id = run_id
+    self.expire_id = False
+
+  @property
+  def id(self) -> uuid.UUID:
+    if self.expire_id:
+      raise RuntimeError("run.id expired during graph execution")
+    return self._run_id
 
 
 def test_persisted_evidence_view_uses_server_ids_and_redacts_secrets():
@@ -112,6 +126,13 @@ def test_persisted_evidence_view_uses_server_ids_and_redacts_secrets():
     "api_key": "[REDACTED]",
     "message": "database timeout",
   }
+
+
+def test_default_agent_budget_allows_more_response_tokens_without_raising_total():
+  assert DEFAULT_AGENT_INVESTIGATION_BUDGET.max_output_tokens_per_call == 2048
+  assert DEFAULT_AGENT_INVESTIGATION_BUDGET.max_model_tokens == 20_000
+  assert DEFAULT_AGENT_INVESTIGATION_BUDGET.max_model_calls == 3
+  assert DEFAULT_AGENT_INVESTIGATION_BUDGET.max_tool_calls == 2
 
 
 @pytest.mark.asyncio
@@ -239,12 +260,10 @@ async def test_runtime_connects_registry_graph_and_investigation_run(
     max_model_calls=2,
     max_model_tokens=2000,
     max_tool_calls=1,
-    max_duration_seconds=10,
-    max_step_seconds=1,
     max_output_tokens_per_call=100,
   )
-  run = SimpleNamespace(
-    id=run_id,
+  run = ExpiringRun(
+    run_id=run_id,
     project_id=context.project_id,
     incident_id=context.incident_id,
     requested_by_user_id=context.user.id,
@@ -277,7 +296,17 @@ async def test_runtime_connects_registry_graph_and_investigation_run(
     "app.services.investigation_graph_runtime.list_incident_evidence",
     AsyncMock(return_value=[]),
   )
-  model = ScriptedAbstentionModel()
+
+  class ExpiringIdAfterModelCall(ScriptedAbstentionModel):
+    async def propose(self, payload: dict, *, max_output_tokens: int):
+      response = await super().propose(
+        payload,
+        max_output_tokens=max_output_tokens,
+      )
+      run.expire_id = True
+      return response
+
+  model = ExpiringIdAfterModelCall()
 
   completed_run, graph_result = await run_agent_investigation(
     session=session,
@@ -299,7 +328,9 @@ async def test_runtime_connects_registry_graph_and_investigation_run(
   assert run.agent_report["budget_usage"]["model_calls"] == 1
   usage = run.agent_report["budget_usage"]
   assert usage["model_tokens"] == (
-    usage["model_tokens_consumed"] + usage["model_tokens_reserved"]
+    usage["model_tokens_consumed"]
+    + usage["model_tokens_unreconciled"]
+    + usage["model_tokens_reserved"]
   )
   assert usage["model_tokens_consumed"] > 0
   assert usage["model_tokens_reserved"] == 0
@@ -325,8 +356,6 @@ async def test_runtime_rejects_run_from_another_user_before_model_call():
     max_model_calls=1,
     max_model_tokens=100,
     max_tool_calls=0,
-    max_duration_seconds=10,
-    max_step_seconds=1,
     max_output_tokens_per_call=10,
   )
 
@@ -356,8 +385,6 @@ async def test_agent_run_reservation_is_idempotent_and_request_bound():
     max_model_calls=2,
     max_model_tokens=2000,
     max_tool_calls=1,
-    max_duration_seconds=10,
-    max_step_seconds=1,
     max_output_tokens_per_call=100,
   )
   existing_run = SimpleNamespace(request_hash="")

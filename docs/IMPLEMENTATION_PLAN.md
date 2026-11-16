@@ -28,16 +28,16 @@ The current backend includes:
   correlations. Correlation is not causal proof.
 * Durable investigation run records, idempotency, and status/history.
 * A static typed tool registry, an operator-triggered, feature-gated Gemini
-  Google Search grounding tool with persisted citations, and a feature-gated,
-  one-call Gemini synthesis endpoint for evidence on a completed run.
+  Google Search grounding tool with persisted citations, a feature-gated,
+  one-call Gemini synthesis endpoint for evidence on a completed run, and a
+  separately feature-gated bounded Gemini/LangGraph investigation endpoint.
   Synthesis does not call tools.
 
 One live Gemini request using only the synthetic `metric-regression` fixture
 succeeded. This verifies a provider request, not report accuracy, the complete
 API persistence workflow, or production readiness. The synthesis feature
-defaults off. This checkout contains an internal LangGraph investigation
-prototype, but no production model adapter, public AI-investigation route, or
-frontend.
+defaults off. The AI-directed investigation endpoint is operator-triggered
+and disabled by default. No frontend is included in this checkout.
 
 ## Architecture and safety rules
 
@@ -161,11 +161,11 @@ row-lock test in the unrelated Alertmanager suite.
 
 ## Phase 3 — Investigation engine
 
-**Status: in progress.** A bounded LangGraph runtime, isolated deterministic
-tests, registry adapter, durable run reporting, and optional PostgreSQL
-checkpoint support are implemented. The runtime has no production model
-adapter or public start/resume endpoint, so it is not yet a user-facing
-AI-directed investigation feature.
+**Status: in progress.** A bounded LangGraph runtime, deterministic tests,
+registry adapter, durable run reporting, PostgreSQL checkpoints, a Gemini
+adapter, and an authenticated operator-triggered endpoint are implemented.
+The feature is off by default and has not been evaluated with live Gemini
+calls or for investigation quality.
 
 ### Recommended implementation order
 
@@ -175,18 +175,18 @@ AI-directed investigation feature.
    tool authorization, hard-budget compliance, and behavior under provider
    failure. Use a stub model and fake tools for deterministic tests; require
    explicit approval for any live Gemini evaluation.
-2. Implement one typed, bounded investigation graph: load authorized incident
-   context, select at most one discriminating read-only tool call per cycle,
-   validate/execute only through `app/tools/registry.py`, record tool result
-   and evidence IDs, update competing hypotheses, and stop with a cited
-   conclusion or explicit inconclusive result. Enforce iteration, tool,
-   latency, and model-token budgets in backend code, not in the prompt.
-3. Use LangGraph for conditional routing and bounded iteration. Reuse
-   `InvestigationRun` as the product lifecycle record; use a PostgreSQL
-   checkpointer keyed by the run ID only for graph continuation state. Do not
-   put credentials in graph state, expose direct model-to-provider access, or
-   add a separate agent service. Preserve the existing synchronous
-   caller-directed investigation API and keep AI investigation explicitly
+2. The typed, bounded investigation graph is implemented: it loads authorized
+   incident context, permits at most one discriminating read-only tool call
+   per cycle, validates and executes only through `app/tools/registry.py`,
+   records tool results and evidence IDs, and stops with a cited conclusion
+   or explicit inconclusive result. Iteration, tool, latency, and model-token
+   budgets are enforced in backend code, not in the prompt.
+3. LangGraph provides conditional routing and bounded iteration.
+   `InvestigationRun` is the product lifecycle record; the PostgreSQL
+   checkpointer keyed by run ID stores graph continuation state. Credentials
+   are not put in graph state, the model has no direct provider access, and no
+   separate agent service is added. The existing synchronous caller-directed
+   investigation API is preserved; AI investigation remains explicitly
    gated.
 4. Add append-only step persistence only if the product needs durable
    per-step UI/history beyond LangGraph checkpoints. Keep evidence records as
@@ -229,43 +229,35 @@ adjudication.
 The evaluator does not call a model or tools; scripted traces are test inputs,
 not evidence of LLM reasoning quality. No live provider request was made.
 
-The bounded graph uses a deterministic injected model interface, one
+The bounded graph uses a Gemini model adapter, one
 application-validated read-only tool action per cycle, a shared server-side
 budget, server-persisted evidence IDs, and a fail-closed conclusion contract.
-Retries are not configured. Checkpoint state pins the budget and tool schemas;
-resume refuses to replay an interrupted model or tool operation. Fake tools
-exist only in tests. Production bindings are created from `ToolRegistry`,
-re-query persisted evidence within incident scope, and sanitize evidence using
-the existing synthesis redactor. `InvestigationRun.agent_report` stores the
-terminal outcome and budget usage.
+The adapter calls Gemini `countTokens` before every generation using the
+structured prompt and rejects count/provider errors; generation usage is
+reconciled against the reservation. Transient provider failures are retried at
+most twice within the model-call and token budgets. The AI investigation has
+no application-enforced wall-clock timeout; cycle, model-call, token, and
+tool-call budgets still apply. Checkpoint state pins the budget and tool
+schemas; resume refuses to replay an interrupted model or tool operation.
+Stale-run cleanup excludes active bounded AI investigations. Production
+bindings come from `ToolRegistry`,
+exclude the public internet search tool, re-query evidence within incident
+scope, and sanitize tool evidence. The authenticated endpoint is disabled by
+default and stores terminal outcome and budget use in
+`InvestigationRun.agent_report`. Per-run cycle, token, and tool-call budgets
+remain enforced.
 
-`AI_INVESTIGATION_ENABLED` defaults to false. When enabled it initializes the
-PostgreSQL checkpointer; it does not enable a model provider or expose an API
-route. The run service is internal and requires an injected model and
-checkpointer. No production model adapter or user-facing AI-directed
-investigation endpoint is implemented. No live Gemini agent calls or mutating
-tools are enabled. The
-`agent_report` migration has been added but has not been applied to any
-database.
+The AI adapter and endpoint have mocked tests only; no live model call was
+made. Token counters live in checkpointed graph state, not an atomic database
+ledger shared across concurrent workers. Concurrent duplicate execution of
+one run is therefore not yet certified as budget-safe.
 
-Token budgets reserve a server-counted input and bounded output allowance
-before each provider call, then reconcile the provider-reported input and
-output usage. Actual usage is accumulated across calls; uncompleted calls keep
-their reservation conservatively, and usage exceeding its reservation fails
-the run closed. This is only an enforceable provider token budget when the
-eventual provider adapter returns trustworthy usage and the preflight counter
-matches provider accounting. No production model adapter is present, so this
-contract is currently verified only with deterministic scripted models.
-The counters currently live in checkpointed graph state, not an atomic
-database ledger shared across concurrent workers. Concurrent duplicate
-execution of one run is therefore not yet certified as budget-safe.
-
-**Remaining before user-facing activation:** implement an explicitly approved
-model adapter and API, verify its preflight and reported token accounting,
-implement an atomic run-level budget ledger, test production PostgreSQL
-checkpoint setup/recovery on a disposable database, set quality thresholds on
-a held-out dataset, and define checkpoint retention. Until those gates pass,
-do not enable AI-directed runs in production or describe scripted metrics as
+**Remaining before production activation:** verify PostgreSQL checkpoint
+setup/recovery on a disposable database, implement an atomic run-level budget
+ledger or otherwise certify concurrent execution behavior, set quality
+thresholds on held-out data, define checkpoint retention, and obtain explicit
+approval for live provider evaluation/data handling. Until those gates pass,
+do not enable AI-directed runs in production or describe synthetic metrics as
 LLM accuracy.
 
 ## Phase 4 — Knowledge and memory
@@ -324,8 +316,9 @@ separately approved.
 
 ## Current change verification
 
-The latest Phase 1 changes make read-only registration opt-in, publish the
-shared typed output schema with each tool descriptor, document the GitHub App
-environment variables, and add mocked tests for installation-token header
-handling and requested read-only permissions. They require no database
-migration. The authorized live metadata check is recorded under Phase 1.
+The bounded Gemini adapter, async `countTokens` preflight, authenticated
+AI-investigation route, default-off configuration, run limits, and mocked
+provider/endpoint tests are implemented. The full automated suite reports
+241 passed and 2 skipped; compileall, whitespace validation, and migration
+head checks pass. No live Gemini investigation was run. This feature reuses
+the current database schema and requires no new migration.

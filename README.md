@@ -313,7 +313,11 @@ these endpoints.
 
 AI synthesis is a separate, explicit action on a completed M5 run. It does not
 start automatically and does not let Gemini choose tools or query connected
-providers.
+providers. When requested, it can also produce evidence-grounded remediation
+recommendations, including implementation, verification, risks, and rollback
+guidance when the supplied run context supports those details. These are plans
+only; synthesis never executes a command or changes infrastructure, and
+uncertain causes must be presented as conditional recommendations.
 
 Configure `GEMINI_API_KEY` in the API process environment or local `.env`, then
 set `GEMINI_SYNTHESIS_ENABLED=true` to enable the endpoint. Synthesis is
@@ -348,6 +352,88 @@ or a strict $0 bill. No successful live model response has yet been evaluated,
 so this feature is not a validated root-cause investigator. Treat output as
 untrusted suggestions for human review, not as established cause or executed
 action.
+
+## User-triggered AI incident investigation
+
+The bounded AI investigation endpoint runs the internal LangGraph workflow on
+request; it is separate from one-call evidence synthesis. It is disabled by
+default. Set `GEMINI_API_KEY`, set `AI_INVESTIGATION_ENABLED=true`, apply
+`alembic upgrade head`, and restart the API so it initializes the PostgreSQL
+checkpoint store:
+
+OpsPilot defaults `GEMINI_MODEL` to `gemini-3.6-flash` for investigation,
+synthesis, and operator-triggered web search. Override it with a supported
+Gemini model ID only when that model supports the API features used by the
+selected workflow.
+
+To make a direct live smoke test without the OpsPilot API, Docker, an incident,
+or an application endpoint, run this from the repository root after setting
+`GEMINI_API_KEY` in `.env`:
+
+```sh
+python scripts/verify_gemini_integration.py \
+  --confirm-google-data-transfer
+```
+
+The script sends only its built-in synthetic fixture to Google's Gemini API.
+It checks token counting, structured generation, provider usage, and evidence
+citations; it prints the model response and exits nonzero on failure. It leaves
+`maxOutputTokens` unset for generation so a small local cap does not truncate
+Gemini's thinking or structured answer; Google's model output limit still
+applies. The confirm flag is required because the request transmits data to
+Google and may incur usage charges. A successful smoke test verifies the
+key/model/API path, not the accuracy of incident conclusions or the full
+PostgreSQL-backed investigation workflow.
+
+```text
+POST /projects/{project_id}/incidents/{incident_id}/investigate-ai
+{"question": "What does the available evidence support about this incident?"}
+```
+
+The caller must be an authorized project member. The synchronous response is
+the durable investigation run, and `X-Investigation-Run-ID` identifies it.
+`Idempotency-Key` replays the saved terminal result for the same request; a
+different request using that key returns HTTP 409. Running duplicates also
+return HTTP 409. The AI investigation has no application-enforced wall-clock
+deadline; it remains bounded by server-enforced cycle, model-call, token, and
+tool-call budgets. A client, reverse proxy, server shutdown, or external
+provider may still terminate a request.
+
+The model receives the question, incident ID, up to 100 persisted incident
+evidence records after the existing evidence sanitizer, and schemas for
+available read-only tools. When selected by the graph, tool results are
+reloaded from incident-scoped persisted evidence and sanitized before being
+shown to Gemini. Source credentials and arbitrary caller-supplied endpoints
+are not included. Both the token preflight and generation requests send this
+prompt to Google. The graph excludes the `internet.search` tool: it never
+searches the public web automatically.
+
+Server-enforced defaults cap a run at three cycles/generation calls, 20,000
+total model tokens, two read-only tool calls, and 2,048 output tokens per
+generation. There is no graph-step, run-level, or Gemini HTTP client timeout
+for this AI workflow. Connected data-source integrations retain their own
+service-level timeouts. Before each generation the adapter calls Gemini
+`countTokens` with the exact structured prompt, then
+reconciles reserved tokens against provider-reported generation usage. The
+graph retries transient provider failures at most twice, honors `Retry-After`
+and counts every generation attempt against the existing model-call and token
+budgets. Token-count preflight
+attempts are also included in `provider_attempts`. Provider errors are stored
+using stable safe classifications, never raw provider messages. If a
+generation fails without reliable usage metadata, its reservation is moved
+from `model_tokens_reserved` to `model_tokens_unreconciled`; `model_tokens`
+is the conservative sum of confirmed, unreconciled, and currently reserved
+tokens, not a claim that all those tokens were billed. A counting failure
+stops the run before generation; over-budget or unreconcilable usage fails
+closed. These controls are per graph run, not an atomic shared ledger across
+concurrent workers.
+
+The feature has only mocked provider coverage in this checkout. Keep it
+disabled until PostgreSQL checkpoint/recovery behavior, provider data handling,
+and held-out investigation quality have been evaluated. The selected Gemini
+tier's data-use caveats described above also apply to both token-count and
+generation requests. Reports are untrusted suggestions for operator review,
+not verified root causes or remediation.
 
 ## Operator-triggered internet search
 
@@ -674,8 +760,9 @@ Incident statuses start at `open`; supported transitions are
 and `resolved` to `open`. An incident with a linked firing Alertmanager alert
 cannot be manually resolved. Source events and incident evidence are stored
 separately. Access to project incidents and events requires project membership;
-webhooks require their source credential. There is not yet an AI investigation, cross-alert correlation, or remediation
-workflow.
+webhooks require their source credential. A gated, operator-triggered AI
+investigation endpoint is available but not quality-validated; cross-alert
+correlation and remediation workflows are not implemented.
 
 ## GitHub App integration
 
@@ -759,11 +846,10 @@ lifecycle intake, Loki log evidence retrieval, manual and webhook-created
 incidents, persisted evidence, operator-triggered grounded internet search,
 and caller-directed investigations across configured integrations. A
 feature-gated Gemini synthesis endpoint can produce a bounded report from
-evidence on a completed investigation run; it does not select tools or run an
-investigation loop. An internal LangGraph investigation prototype exists, but
-there is not yet a production model adapter or public AI-investigation route.
-Autonomous investigation, remediation, and a frontend are not implemented in
-this backend checkout. The
+evidence on a completed investigation run, and a separately gated, bounded
+Gemini-backed LangGraph endpoint can conduct an operator-triggered read-only
+investigation. Neither feature is validated for root-cause accuracy.
+Remediation and a frontend are not implemented in this backend checkout. The
 migration removing the legacy organization and invitation schema refuses to
 run while records in those legacy tables remain; it preserves users, projects,
 project memberships, and environments. This migration is irreversible.

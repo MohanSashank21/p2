@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.incident_schema import IncidentEvidenceResponse
 from app.schemas.prometheus_schema import (
@@ -78,6 +78,20 @@ class CombinedIncidentInvestigationResponse(BaseModel):
   incident_id: uuid.UUID
   integrations: dict[str, IntegrationInvestigationResult]
   evidence: list[IncidentEvidenceResponse]
+
+
+class AgentInvestigationRequest(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  question: str = Field(min_length=1, max_length=1000)
+
+  @field_validator("question")
+  @classmethod
+  def validate_question(cls, question: str) -> str:
+    normalized = question.strip()
+    if not normalized:
+      raise ValueError("Investigation question must not be blank.")
+    return normalized
 
 
 class InvestigationRunResponse(BaseModel):

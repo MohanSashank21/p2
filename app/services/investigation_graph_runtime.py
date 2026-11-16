@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -27,7 +26,6 @@ from app.services.investigation_graph import (
   resume_investigation_graph,
 )
 from app.services.investigation_run_service import (
-  RUN_TIMEOUT_SECONDS,
   complete_agent_investigation_run,
 )
 from app.services.investigation_synthesis_service import _sanitize_evidence
@@ -141,10 +139,7 @@ async def run_agent_investigation(
     raise ValueError("InvestigationRun must have project and incident scope.")
   if run.requested_by_user_id != user.id:
     raise PermissionDeniedError("InvestigationRun belongs to another user.")
-  if budget.max_duration_seconds > RUN_TIMEOUT_SECONDS:
-    raise ValueError(
-      f"Investigation duration cannot exceed {RUN_TIMEOUT_SECONDS} seconds.",
-    )
+  run_id = run.id
   normalized_question = question.strip()
   expected_request = {
     "mode": "bounded_ai_investigation",
@@ -156,11 +151,6 @@ async def run_agent_investigation(
     or run.request_criteria != expected_request
   ):
     raise ValueError("InvestigationRun request does not match the graph input.")
-  started_at = run.started_at
-  if started_at.tzinfo is None:
-    started_at = started_at.replace(tzinfo=UTC)
-  deadline_epoch_seconds = started_at.timestamp() + budget.max_duration_seconds
-
   incident: Incident = await get_project_incident(
     session,
     run.project_id,
@@ -191,14 +181,13 @@ async def run_agent_investigation(
     tool_context,
   )
   state = create_investigation_state(
-    run_id=run.id,
+    run_id=run_id,
     incident_id=incident.id,
     question=normalized_question,
     evidence=evidence,
     tools=bindings,
     budget=budget,
     initial_evidence_truncated=evidence_truncated,
-    deadline_epoch_seconds=deadline_epoch_seconds,
   )
   graph = compile_investigation_graph(
     model=model,
@@ -206,20 +195,20 @@ async def run_agent_investigation(
     budget=budget,
     checkpointer=checkpointer,
   )
-  config = investigation_graph_config(run.id)
+  config = investigation_graph_config(run_id)
   checkpoint = await graph.aget_state(config)
   if checkpoint.values:
     if not checkpoint.next and checkpoint.values.get("terminal"):
       result = checkpoint.values
     elif checkpoint.next:
-      result = await resume_investigation_graph(graph, run.id)
+      result = await resume_investigation_graph(graph, run_id)
     else:
       raise RuntimeError("Investigation checkpoint has no resumable graph node.")
   else:
     result = await graph.ainvoke(state, config)
   completed_run = await complete_agent_investigation_run(
     session,
-    run.id,
+    run_id,
     result,
   )
   return completed_run, result

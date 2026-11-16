@@ -14,7 +14,6 @@ def use_host_gateway(raw_url: str) -> str:
     )
   return raw_url
 
-
 for variable in ("DATABASE_URL", "REDIS_URL"):
   value = os.environ.get(variable)
   if value:

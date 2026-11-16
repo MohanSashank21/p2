@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import NodeCancelledError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.services.investigation_graph import (
   InvestigationBudget,
@@ -53,7 +54,7 @@ class ScriptedModel:
     self.calls: list[dict[str, Any]] = []
     self.output_limits: list[int] = []
 
-  def count_input_tokens(self, payload: dict[str, Any]) -> int:
+  async def count_input_tokens(self, payload: dict[str, Any]) -> int:
     return self.token_counter(payload)
 
   async def propose(
@@ -78,7 +79,7 @@ class ScriptedModel:
         response = await response
     if isinstance(response, InvestigationModelResponse):
       response = response.model_copy(
-        update={"input_tokens": self.count_input_tokens(payload)},
+        update={"input_tokens": await self.count_input_tokens(payload)},
       )
     return response
 
@@ -113,8 +114,6 @@ def _budget(**overrides: Any) -> InvestigationBudget:
     "max_model_calls": 4,
     "max_model_tokens": 20_000,
     "max_tool_calls": 4,
-    "max_duration_seconds": 10,
-    "max_step_seconds": 1,
     "max_output_tokens_per_call": 100,
   }
   values.update(overrides)
@@ -194,8 +193,17 @@ async def test_loop_concludes_only_with_server_known_evidence_ids():
   assert result["outcome"] == "conclusion"
   assert result["evidence_citations"] == [str(evidence.id)]
   assert result["model_call_count"] == 1
+  assert result["provider_attempt_count"] == 2
   assert result["model_tokens_consumed"] > 0
   assert result["model_tokens_reserved"] == 0
+
+
+def test_conclusion_requires_at_least_one_evidence_citation():
+  with pytest.raises(ValidationError, match="at least one evidence citation"):
+    InvestigationDecision(
+      action="conclude",
+      claim="A claim without supporting evidence.",
+    )
 
 
 @pytest.mark.asyncio
@@ -295,6 +303,41 @@ async def test_failed_tool_result_cannot_smuggle_evidence_into_model_context():
 
 
 @pytest.mark.asyncio
+async def test_tool_can_reuse_identical_incident_evidence_without_duplicating_it():
+  evidence = _evidence({"observation": "the workflow failed at build"})
+  model = ScriptedModel([
+    _response(InvestigationDecision(
+      action="tool",
+      tool_name="logs.query",
+      arguments={"query": "workflow failure"},
+    )),
+    _response(InvestigationDecision(
+      action="conclude",
+      claim="The workflow failed at build.",
+      evidence_ids=[evidence.id],
+    )),
+  ])
+  tool = _binding(lambda _arguments: asyncio.sleep(
+    0,
+    result=_tool_result([evidence]),
+  ))
+
+  result = await _run(
+    model,
+    state=_state(evidence=[evidence], tools=(tool,)),
+    tools=(tool,),
+  )
+
+  assert result["outcome"] == "conclusion", {
+    key: result.get(key)
+    for key in ("stop_reason", "failure_detail", "decision", "tool_failures")
+  }
+  assert result["evidence_citations"] == [str(evidence.id)]
+  assert len(result["evidence"]) == 1
+  assert result["tool_failures"] == []
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_tool_request_never_executes():
   calls = 0
 
@@ -316,6 +359,10 @@ async def test_unauthorized_tool_request_never_executes():
   assert result["outcome"] == "failed"
   assert result["stop_reason"] == "tool_not_authorized"
   assert result["tool_call_count"] == 1
+  assert result["tool_failures"] == [{
+    "tool_name": "shell.execute",
+    "failure_code": "tool_not_authorized",
+  }]
   assert calls == 0
 
 
@@ -345,6 +392,49 @@ async def test_invalid_tool_arguments_never_execute():
 
 
 @pytest.mark.asyncio
+async def test_strict_tool_validation_accepts_json_uuid_arguments():
+  class GitHubArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    repository_id: int
+    event_id: uuid.UUID
+
+  executed_arguments: list[dict[str, Any]] = []
+
+  async def tool_handler(arguments: dict[str, Any]) -> ReadOnlyToolResult:
+    executed_arguments.append(arguments)
+    return _tool_result()
+
+  tool = ReadOnlyToolBinding(
+    name="github.investigate_failed_workflow",
+    description="Read a failed workflow.",
+    input_model=GitHubArguments,
+    handler=tool_handler,
+  )
+  event_id = str(uuid.uuid4())
+  model = ScriptedModel([
+    _response(InvestigationDecision(
+      action="tool",
+      tool_name=tool.name,
+      arguments={
+        "repository_id": 1249219668,
+        "event_id": event_id,
+      },
+    )),
+    _response(InvestigationDecision(action="inconclusive")),
+  ])
+
+  result = await _run(model, tools=(tool,))
+
+  assert result["outcome"] == "inconclusive"
+  assert result["tool_call_count"] == 1
+  assert executed_arguments == [{
+    "repository_id": 1249219668,
+    "event_id": event_id,
+  }]
+
+
+@pytest.mark.asyncio
 async def test_model_provider_failure_stops_without_retry():
   model = ScriptedModel([ModelProviderError("synthetic outage")])
 
@@ -354,13 +444,164 @@ async def test_model_provider_failure_stops_without_retry():
   assert result["stop_reason"] == "model_provider_failure"
   assert result["model_call_count"] == 1
   assert result["model_tokens_consumed"] == 0
-  assert result["model_tokens_reserved"] > 0
+  assert result["model_tokens_reserved"] == 0
+  assert result["model_tokens_unreconciled"] > 0
   assert len(model.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_model_timeout_is_counted_and_not_retried():
-  async def timeout(
+async def test_model_provider_failure_preserves_safe_failure_code():
+  model = ScriptedModel([
+    ModelProviderError(
+      "Provider rejected the generation request.",
+      failure_code="gemini_invalid_request",
+    ),
+  ])
+
+  result = await _run(model)
+
+  assert result["outcome"] == "failed"
+  assert result["stop_reason"] == "gemini_invalid_request"
+  assert result["model_tokens_consumed"] == 0
+  assert result["model_tokens_reserved"] == 0
+  assert result["model_tokens_unreconciled"] > 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_decision_logs_run_correlated_safe_diagnostic(caplog):
+  state = _state()
+  model = ScriptedModel([
+    ModelProviderError(
+      "Gemini returned an invalid investigation decision; "
+      "decision failed validation at: evidence_ids.0:invalid_value.",
+      failure_code="invalid_investigation_decision",
+      input_tokens=10,
+      output_tokens=2,
+    ),
+  ])
+
+  with caplog.at_level(
+    logging.WARNING,
+    logger="app.services.investigation_graph",
+  ):
+    result = await _run(model, state=state)
+
+  diagnostic = next(
+    record
+    for record in caplog.records
+    if record.getMessage()
+    == "Gemini investigation decision failed schema validation"
+  )
+  assert diagnostic.investigation_run_id == state["run_id"]
+  assert diagnostic.response_format == "application/json"
+  assert diagnostic.response_schema == "investigation_decision"
+  assert diagnostic.provider_http_status == 200
+  assert diagnostic.candidate_finish_reason == "STOP"
+  assert diagnostic.generation_attempt == 1
+  assert diagnostic.provider_request_count == 2
+  assert diagnostic.input_tokens == 10
+  assert diagnostic.output_tokens == 2
+  assert "evidence_ids.0:invalid_value" in diagnostic.validation_diagnostic
+  assert result["failure_detail"] == (
+    "Gemini returned an invalid investigation decision."
+  )
+
+
+@pytest.mark.asyncio
+async def test_transient_provider_failure_retries_within_model_call_budget():
+  model = ScriptedModel([
+    ModelProviderError(
+      "Gemini was rate limited.",
+      failure_code="gemini_rate_limited",
+      retryable=True,
+      retry_after_seconds=0,
+    ),
+    _response(InvestigationDecision(action="inconclusive")),
+  ])
+
+  result = await _run(model)
+
+  assert result["outcome"] == "inconclusive"
+  assert result["model_call_count"] == 2
+  assert result["provider_attempt_count"] == 3
+  assert len(model.calls) == 2
+  assert result["model_tokens_unreconciled"] > 0
+  assert result["model_tokens_reserved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_retries_do_not_exceed_model_call_budget():
+  model = ScriptedModel([
+    ModelProviderError(
+      "Gemini was rate limited.",
+      failure_code="gemini_rate_limited",
+      retryable=True,
+      retry_after_seconds=0,
+    )
+    for _ in range(3)
+  ])
+
+  result = await _run(model, budget=_budget(max_model_calls=2))
+
+  assert result["outcome"] == "failed"
+  assert result["stop_reason"] == "gemini_rate_limited"
+  assert result["model_call_count"] == 2
+  assert result["provider_attempt_count"] == 3
+  assert len(model.calls) == 2
+  assert result["model_tokens_reserved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_honored_without_investigation_deadline(monkeypatch):
+  model = ScriptedModel([
+    ModelProviderError(
+      "Gemini was rate limited.",
+      failure_code="gemini_rate_limited",
+      retryable=True,
+      retry_after_seconds=5,
+    ),
+    _response(InvestigationDecision(action="inconclusive")),
+  ])
+
+  delays: list[float] = []
+
+  async def record_delay(delay: float) -> None:
+    delays.append(delay)
+
+  monkeypatch.setattr("app.services.investigation_graph.asyncio.sleep", record_delay)
+
+  result = await _run(model)
+
+  assert result["outcome"] == "inconclusive"
+  assert result["model_call_count"] == 2
+  assert len(model.calls) == 2
+  assert delays == [5]
+  assert result["model_tokens_reserved"] == 0
+  assert result["model_tokens_unreconciled"] > 0
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_with_usage_reconciles_tokens():
+  model = ScriptedModel([
+    ModelProviderError(
+      "Gemini returned a malformed decision.",
+      failure_code="invalid_investigation_decision",
+      input_tokens=8,
+      output_tokens=2,
+    ),
+  ])
+
+  result = await _run(model)
+
+  assert result["outcome"] == "failed"
+  assert result["model_tokens_consumed"] == 10
+  assert result["model_tokens_unreconciled"] == 0
+  assert result["model_tokens_reserved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_model_call_can_exceed_old_investigation_timeout_values():
+  async def slow_model(
     _payload: dict[str, Any],
     *,
     max_output_tokens: int,
@@ -371,14 +612,14 @@ async def test_model_timeout_is_counted_and_not_retried():
       max_output_tokens,
     )
 
-  model = ScriptedModel([timeout])
-  budget = _budget(max_step_seconds=0.005)
+  model = ScriptedModel([slow_model])
 
-  result = await _run(model, budget=budget)
+  result = await _run(model)
 
-  assert result["outcome"] == "failed"
-  assert result["stop_reason"] == "model_timeout"
+  assert result["outcome"] == "inconclusive"
   assert result["model_call_count"] == 1
+  assert result["model_tokens_reserved"] == 0
+  assert result["model_tokens_consumed"] > 0
   assert len(model.calls) == 1
 
 
@@ -394,6 +635,8 @@ async def test_malformed_model_response_is_not_retried():
   assert result["outcome"] == "failed"
   assert result["stop_reason"] == "malformed_model_response"
   assert result["model_call_count"] == 1
+  assert result["model_tokens_reserved"] == 0
+  assert result["model_tokens_unreconciled"] > 0
   assert len(model.calls) == 1
 
 
@@ -410,14 +653,15 @@ async def test_unserializable_model_response_fails_closed():
 
 
 @pytest.mark.asyncio
-async def test_tool_timeout_is_counted_once_and_failure_does_not_add_evidence():
+async def test_tool_call_can_complete_without_graph_timeout():
   calls = 0
+  tool_evidence = _evidence({"observation": "tool completed"})
 
   async def slow_tool(_arguments: dict[str, Any]) -> ReadOnlyToolResult:
     nonlocal calls
     calls += 1
     await asyncio.sleep(0.05)
-    return _tool_result([_evidence({"must_not": "appear"})])
+    return _tool_result([tool_evidence])
 
   model = ScriptedModel([
     _response(InvestigationDecision(
@@ -431,14 +675,13 @@ async def test_tool_timeout_is_counted_once_and_failure_does_not_add_evidence():
   result = await _run(
     model,
     tools=(_binding(slow_tool),),
-    budget=_budget(max_step_seconds=0.005),
   )
 
   assert result["outcome"] == "inconclusive"
   assert result["tool_call_count"] == 1
   assert calls == 1
-  assert result["evidence"] == []
-  assert result["tool_failures"][0]["failure_code"] == "tool_timeout"
+  assert [row["id"] for row in result["evidence"]] == [str(tool_evidence.id)]
+  assert result["tool_failures"] == []
 
 
 @pytest.mark.asyncio
@@ -540,40 +783,17 @@ async def test_iteration_and_model_call_limits_are_shared_across_cycles():
 
 
 @pytest.mark.asyncio
-async def test_deadline_is_not_reset_when_run_is_resumed():
-  now = [100.0]
+async def test_state_does_not_store_a_wall_clock_deadline():
   evidence = _evidence({"observation": "persisted"})
-  model = ScriptedModel([
-    _response(InvestigationDecision(action="inconclusive")),
-  ])
-  budget = _budget(max_duration_seconds=2)
   state = create_investigation_state(
     run_id=uuid.uuid4(),
     incident_id=uuid.uuid4(),
     question="test persisted deadline",
     evidence=[evidence],
     tools=(),
-    budget=budget,
-    clock=lambda: now[0],
+    budget=_budget(),
   )
-  saver = InMemorySaver()
-  graph = compile_investigation_graph(
-    model=model,
-    tools=(),
-    budget=budget,
-    checkpointer=saver,
-    clock=lambda: now[0],
-    interrupt_after=("reserve_cycle",),
-  )
-  run_id = uuid.UUID(state["run_id"])
-  await graph.ainvoke(state, investigation_graph_config(run_id))
-  now[0] += 3
-  result = await resume_investigation_graph(graph, run_id)
-
-  assert result["outcome"] == "inconclusive"
-  assert result["stop_reason"] == "time_budget_exhausted"
-  assert result["deadline_epoch_seconds"] == 102.0
-  assert len(model.calls) == 0
+  assert "deadline_epoch_seconds" not in state
 
 
 @pytest.mark.asyncio
@@ -678,6 +898,53 @@ async def test_invalid_input_token_count_fails_before_model_call():
 
 
 @pytest.mark.asyncio
+async def test_token_count_provider_failure_stops_before_generation():
+  def fail_count(_payload: dict[str, Any]) -> int:
+    raise ModelProviderError("synthetic token count outage")
+
+  model = ScriptedModel(
+    [_response(InvestigationDecision(action="inconclusive"))],
+    token_counter=fail_count,
+  )
+
+  result = await _run(model)
+
+  assert result["outcome"] == "failed"
+  assert result["stop_reason"] == "model_token_count_failure"
+  assert result["model_call_count"] == 0
+  assert len(model.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_transient_token_count_failure_retries_inside_step_budget():
+  class RetryableTokenCountModel(ScriptedModel):
+    count_calls = 0
+
+    async def count_input_tokens(self, payload: dict[str, Any]) -> int:
+      self.count_calls += 1
+      if self.count_calls == 1:
+        raise ModelProviderError(
+          "Gemini token counting was rate limited.",
+          failure_code="gemini_rate_limited",
+          retryable=True,
+          retry_after_seconds=0,
+        )
+      return await super().count_input_tokens(payload)
+
+  model = RetryableTokenCountModel([
+    _response(InvestigationDecision(action="inconclusive")),
+  ])
+
+  result = await _run(model)
+
+  assert result["outcome"] == "inconclusive"
+  assert model.count_calls == 3
+  assert result["model_call_count"] == 1
+  assert result["provider_attempt_count"] == 3
+  assert len(model.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_model_cannot_exceed_reserved_output_token_limit():
   model = ScriptedModel([
     _response(InvestigationDecision(action="inconclusive"), output_tokens=2),
@@ -688,7 +955,7 @@ async def test_model_cannot_exceed_reserved_output_token_limit():
   result = await _run(model, budget=budget)
 
   assert result["outcome"] == "failed"
-  assert result["stop_reason"] == "model_token_limit_exceeded"
+  assert result["stop_reason"] == "model_output_token_reservation_exceeded"
   assert result["model_tokens_consumed"] == 102
   assert result["model_tokens_reserved"] == 0
 
@@ -732,7 +999,7 @@ async def test_actual_input_usage_above_preflight_reservation_fails_closed():
   result = await _run(model, budget=budget)
 
   assert result["outcome"] == "failed"
-  assert result["stop_reason"] == "model_token_limit_exceeded"
+  assert result["stop_reason"] == "model_input_token_reservation_exceeded"
   assert result["model_tokens_consumed"] == 12
   assert result["model_tokens_reserved"] == 0
 

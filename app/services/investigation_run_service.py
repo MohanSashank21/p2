@@ -20,6 +20,13 @@ from app.services.investigation_graph import InvestigationBudget
 
 RUN_TIMEOUT_SECONDS = 300
 STALE_RUN_TIMEOUT_SECONDS = RUN_TIMEOUT_SECONDS + 60
+DEFAULT_AGENT_INVESTIGATION_BUDGET = InvestigationBudget(
+  max_cycles=3,
+  max_model_calls=3,
+  max_model_tokens=20_000,
+  max_tool_calls=2,
+  max_output_tokens_per_call=2048,
+)
 
 
 class IdempotencyKeyConflictError(Exception):
@@ -119,13 +126,13 @@ async def fail_stale_investigation_runs(
     .where(
       InvestigationRun.incident_id == incident_id,
       InvestigationRun.status == "running",
+      InvestigationRun.started_at
+      < now - timedelta(seconds=STALE_RUN_TIMEOUT_SECONDS),
       or_(
         InvestigationRun.request_criteria["mode"].as_string().is_(None),
         InvestigationRun.request_criteria["mode"].as_string()
         != "bounded_ai_investigation",
       ),
-      InvestigationRun.started_at
-      < now - timedelta(seconds=STALE_RUN_TIMEOUT_SECONDS),
     )
     .values(
       status="failed",
@@ -257,11 +264,17 @@ async def complete_agent_investigation_run(
     "budget_usage": {
       "cycles": state.get("cycle_count", 0),
       "model_calls": state.get("model_call_count", 0),
+      "provider_attempts": state.get("provider_attempt_count", 0),
       "model_tokens": (
         state.get("model_tokens_consumed", 0)
+        + state.get("model_tokens_unreconciled", 0)
         + state.get("model_tokens_reserved", 0)
       ),
       "model_tokens_consumed": state.get("model_tokens_consumed", 0),
+      "model_tokens_unreconciled": state.get(
+        "model_tokens_unreconciled",
+        0,
+      ),
       "model_tokens_reserved": state.get("model_tokens_reserved", 0),
       "tool_calls": state.get("tool_call_count", 0),
     },
@@ -275,11 +288,13 @@ async def complete_agent_investigation_run(
     if outcome == "failed"
     else None
   )
-  run.failure_detail = (
-    "The bounded investigation did not produce a verified result."
-    if outcome == "failed"
-    else None
-  )
+  run.failure_detail = None
+  if outcome == "failed":
+    run.failure_detail = (
+      str(state["failure_detail"])
+      if state.get("failure_detail")
+      else "The bounded investigation did not produce a verified result."
+    )
   run.completed_at = datetime.now(UTC)
   await session.commit()
   await session.refresh(run)

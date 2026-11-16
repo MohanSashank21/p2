@@ -1,8 +1,10 @@
 import asyncio
+import json
 import os
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite://")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379")
@@ -13,11 +15,13 @@ os.environ.setdefault("OTP_HASH_SECRET_KEY", "test-otp-hmac-secret-not-for-produ
 import pytest
 import pytest_asyncio
 import httpx
+from langgraph.checkpoint.memory import InMemorySaver
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.core.exceptions import RateLimitExceededError
 from app.db import (
   auth,
   environment,
@@ -321,6 +325,184 @@ async def test_authorized_incident_member_can_search_and_persist_grounded_web_ev
   )
 
 
+@pytest.mark.asyncio
+async def test_authorized_member_can_run_bounded_ai_investigation_and_replay(
+  incident_client,
+  monkeypatch,
+):
+  client, session_factory = incident_client
+  owner = await _create_user(session_factory, "ai-investigation-owner")
+  project_id = await _create_project(client, owner, "AI Investigation Project")
+  created = await client.post(
+    f"/projects/{project_id}/incidents",
+    json={
+      "incident_type": "service_outage",
+      "title": "Synthetic API timeout",
+      "description": "Requests intermittently time out in this local test.",
+      "severity": "high",
+    },
+    headers=_headers(owner),
+  )
+  assert created.status_code == 201
+  incident_id = created.json()["id"]
+  evidence_response = await client.get(
+    f"/projects/{project_id}/incidents/{incident_id}/evidence",
+    headers=_headers(owner),
+  )
+  assert evidence_response.status_code == 200
+  evidence_id = evidence_response.json()[0]["id"]
+
+  monkeypatch.setattr(settings, "AI_INVESTIGATION_ENABLED", True)
+  monkeypatch.setattr(settings, "GEMINI_API_KEY", SecretStr("synthetic-api-key"))
+  monkeypatch.setattr("app.api.incidents.RUN_TIMEOUT_SECONDS", 0.01)
+  monkeypatch.setattr(
+    app.state,
+    "investigation_checkpointer",
+    InMemorySaver(),
+    raising=False,
+  )
+  provider_requests: list[httpx.Request] = []
+
+  async def provider_handler(request: httpx.Request) -> httpx.Response:
+    provider_requests.append(request)
+    assert request.headers["x-goog-api-key"] == "synthetic-api-key"
+    payload = json.loads(request.content)
+    if str(request.url).endswith(":countTokens"):
+      assert "generateContentRequest" in payload
+      return httpx.Response(200, json={"totalTokens": 100})
+    await asyncio.sleep(0.05)
+    assert payload["generationConfig"]["responseMimeType"] == "application/json"
+    assert "tools" not in payload
+    decision = {
+      "action": "conclude",
+      "tool_name": None,
+      "arguments": {},
+      "claim": "The incident report records intermittent API timeouts.",
+      "evidence_ids": [evidence_id],
+    }
+    return httpx.Response(
+      200,
+      json={
+        "candidates": [{
+          "finishReason": "STOP",
+          "content": {"parts": [{"text": json.dumps(decision)}]},
+        }],
+        "usageMetadata": {
+          "promptTokenCount": 100,
+          "candidatesTokenCount": 25,
+          "totalTokenCount": 125,
+        },
+      },
+    )
+
+  monkeypatch.setattr(
+    "app.api.incidents.create_gemini_investigation_client",
+    lambda: httpx.AsyncClient(transport=httpx.MockTransport(provider_handler)),
+  )
+  headers = {
+    **_headers(owner),
+    "Idempotency-Key": "local-ai-investigation-001",
+  }
+  response = await client.post(
+    f"/projects/{project_id}/incidents/{incident_id}/investigate-ai",
+    json={"question": "What is supported by this incident evidence?"},
+    headers=headers,
+  )
+
+  assert response.status_code == 200
+  run = response.json()
+  assert run["status"] == "succeeded", json.dumps(run, sort_keys=True)
+  assert run["agent_report"]["outcome"] == "conclusion"
+  assert run["agent_report"]["claim"] == (
+    "The incident report records intermittent API timeouts."
+  )
+  assert run["agent_report"]["evidence_citations"] == [evidence_id]
+  assert run["agent_report"]["budget_usage"]["model_calls"] == 1
+  assert run["agent_report"]["budget_usage"]["model_tokens"] == 125
+  assert "max_step_seconds" not in run["request_criteria"]["budget"]
+  assert "max_duration_seconds" not in run["request_criteria"]["budget"]
+  assert response.headers["X-Investigation-Run-ID"] == run["id"]
+
+  replay = await client.post(
+    f"/projects/{project_id}/incidents/{incident_id}/investigate-ai",
+    json={"question": "What is supported by this incident evidence?"},
+    headers=headers,
+  )
+  assert replay.status_code == 200
+  assert replay.json()["id"] == run["id"]
+  conflict = await client.post(
+    f"/projects/{project_id}/incidents/{incident_id}/investigate-ai",
+    json={"question": "A different question for the same key."},
+    headers=headers,
+  )
+  assert conflict.status_code == 409
+  assert len(provider_requests) == 2
+  assert sum(
+    str(item.url).endswith(":countTokens")
+    for item in provider_requests
+  ) == 1
+  assert sum(
+    str(item.url).endswith(":generateContent")
+    for item in provider_requests
+  ) == 1
+
+  status_response = await client.get(
+    f"/projects/{project_id}/incidents/{incident_id}/investigation-runs/{run['id']}",
+    headers=_headers(owner),
+  )
+  assert status_response.status_code == 200
+  assert status_response.json()["agent_report"] == run["agent_report"]
+
+
+@pytest.mark.asyncio
+async def test_ai_investigation_checks_access_and_configuration(
+  incident_client,
+  monkeypatch,
+):
+  client, session_factory = incident_client
+  owner = await _create_user(session_factory, "ai-investigation-gate-owner")
+  outsider = await _create_user(session_factory, "ai-investigation-gate-outsider")
+  project_id = await _create_project(client, owner, "AI Investigation Gates")
+  created = await client.post(
+    f"/projects/{project_id}/incidents",
+    json={"incident_type": "service_outage", "title": "Gated investigation"},
+    headers=_headers(owner),
+  )
+  incident_id = created.json()["id"]
+  endpoint = (
+    f"/projects/{project_id}/incidents/{incident_id}/investigate-ai"
+  )
+
+  disabled = await client.post(
+    endpoint,
+    json={"question": "What does this evidence support?"},
+    headers=_headers(owner),
+  )
+  assert disabled.status_code == 503
+
+  unauthorized = await client.post(
+    endpoint,
+    json={"question": "What does this evidence support?"},
+    headers=_headers(outsider),
+  )
+  assert unauthorized.status_code == 404
+
+  monkeypatch.setattr(settings, "AI_INVESTIGATION_ENABLED", True)
+  monkeypatch.setattr(settings, "GEMINI_API_KEY", None)
+  missing_key = await client.post(
+    endpoint,
+    json={"question": "What does this evidence support?"},
+    headers=_headers(owner),
+  )
+  assert missing_key.status_code == 503
+
+  monkeypatch.setattr(settings, "GEMINI_API_KEY", SecretStr("synthetic-api-key"))
+  monkeypatch.setattr(
+    app.state,
+    "investigation_checkpointer",
+    InMemorySaver(),
+    raising=False,
+  )
 @pytest.mark.asyncio
 async def test_on_demand_github_workflow_is_persisted_and_correlated_to_incident(
   incident_client,
@@ -1447,7 +1629,7 @@ async def test_stale_running_run_is_marked_interrupted(
 
 
 @pytest.mark.asyncio
-async def test_stale_agent_run_remains_available_for_checkpoint_recovery(
+async def test_running_agent_run_is_not_failed_by_stale_cleanup(
   incident_client,
 ):
   client, session_factory = incident_client
@@ -1480,6 +1662,9 @@ async def test_stale_agent_run_remains_available_for_checkpoint_recovery(
     run_id = run.id
     await fail_stale_investigation_runs(session, incident_id)
     refreshed = await session.get(InvestigationRun, run_id)
+    if refreshed is not None:
+      await session.refresh(refreshed)
 
   assert refreshed is not None
   assert refreshed.status == "running"
+  assert refreshed.failure_code is None

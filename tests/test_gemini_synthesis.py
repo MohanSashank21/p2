@@ -69,6 +69,16 @@ async def test_gemini_synthesis_uses_schema_and_validates_evidence_citations():
     assert body["generationConfig"]["responseMimeType"] == "application/json"
     assert body["generationConfig"]["maxOutputTokens"] == 2048
     assert body["generationConfig"]["responseSchema"]["properties"]["findings"]
+    assert body["generationConfig"]["thinkingConfig"] == {
+      "thinkingLevel": "medium",
+    }
+    assert "temperature" not in body["generationConfig"]
+    system_instruction = body["systemInstruction"]["parts"][0]["text"]
+    assert "6. Remediation planning" in system_instruction
+    assert "7. Practicality and operational safety" in system_instruction
+    assert "8. Plan contents and schema mapping" in system_instruction
+    assert "11. Output contract" in system_instruction
+    assert "Never execute, simulate, or" in system_instruction
     user_text = body["contents"][0]["parts"][0]["text"]
     assert "expected_cause" not in user_text
     assert "relevant_evidence_ids" not in user_text
